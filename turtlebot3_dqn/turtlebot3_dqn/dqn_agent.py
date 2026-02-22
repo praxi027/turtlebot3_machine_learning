@@ -234,7 +234,7 @@ class DQNAgent(Node):
             score = 0
             sum_max_q = 0.0
 
-            time.sleep(1.0)
+            time.sleep(0.2)
 
             while True:
                 local_step += 1
@@ -282,7 +282,7 @@ class DQNAgent(Node):
                     param_dictionary = dict(zip(param_keys, param_values))
                     break
 
-                time.sleep(0.01)
+                time.sleep(0.001)
 
             if self.train_mode:
                 if episode % 100 == 0:
