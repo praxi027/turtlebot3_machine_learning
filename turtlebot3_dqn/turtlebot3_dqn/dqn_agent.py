@@ -159,7 +159,15 @@ class DQNAgent(Node):
         self.epsilon_min = 0.05
         self.batch_size = 128
 
-        self.replay_memory = collections.deque(maxlen=500000)
+        self.replay_buffer_size = 500000
+        self.replay_memory = [None] * self.replay_buffer_size  # circular buffer
+        self.priorities = numpy.zeros(self.replay_buffer_size, dtype=numpy.float32)
+        self.replay_pos = 0      # write pointer
+        self.replay_count = 0    # number of valid entries
+        self.per_alpha = 0.6     # priority exponent (0=uniform, 1=full priority)
+        self.per_beta = 0.4      # IS correction exponent, annealed to 1.0
+        self.per_beta_increment = 0.0005
+        self.per_epsilon = 1e-6  # prevents zero priority
         self.min_replay_memory_size = 5000
 
         self.model = self.create_qnetwork()
@@ -378,47 +386,71 @@ class DQNAgent(Node):
         print('*Target model updated*')
 
     def append_sample(self, transition):
-        self.replay_memory.append(transition)
+        max_p = self.priorities[:self.replay_count].max() if self.replay_count > 0 else 1.0
+        self.replay_memory[self.replay_pos] = transition
+        self.priorities[self.replay_pos] = max_p
+        self.replay_pos = (self.replay_pos + 1) % self.replay_buffer_size
+        self.replay_count = min(self.replay_count + 1, self.replay_buffer_size)
 
     def train_model(self, terminal):
-        if len(self.replay_memory) < self.min_replay_memory_size:
+        if self.replay_count < self.min_replay_memory_size:
             return
-        data_in_mini_batch = random.sample(self.replay_memory, self.batch_size)
 
-        current_states = numpy.array([transition[0] for transition in data_in_mini_batch])
-        current_states = current_states.squeeze()
+        # Prioritized experience replay: sample proportional to priority^alpha
+        n = self.replay_count
+        raw = self.priorities[:n] ** self.per_alpha
+        probs = raw / raw.sum()
+        indices = numpy.random.choice(n, self.batch_size, replace=False, p=probs)
+        data_in_mini_batch = [self.replay_memory[i] for i in indices]
+
+        # Importance-sampling weights to correct for non-uniform sampling bias
+        is_weights = (n * probs[indices]) ** (-self.per_beta)
+        is_weights = (is_weights / is_weights.max()).astype(numpy.float32)
+        self.per_beta = min(1.0, self.per_beta + self.per_beta_increment)
+
+        current_states = numpy.array([t[0] for t in data_in_mini_batch]).squeeze()
         current_qvalues_list = self.model.predict(current_states, verbose=self.verbose)
 
-        next_states = numpy.array([transition[3] for transition in data_in_mini_batch])
-        next_states = next_states.squeeze()
+        next_states = numpy.array([t[3] for t in data_in_mini_batch]).squeeze()
         next_qvalues_list = self.target_model.predict(next_states, verbose=self.verbose)
+        # Double DQN: online network selects action, target network evaluates it
+        next_qvalues_online = self.model.predict(next_states, verbose=self.verbose)
 
         x_train = []
         y_train = []
+        td_errors = []
 
         for index, (current_state, action, reward, _, done) in enumerate(data_in_mini_batch):
             current_q_values = current_qvalues_list[index]
+            old_q = current_q_values[action]
 
             if not done:
-                future_reward = numpy.max(next_qvalues_list[index])
+                best_next_action = numpy.argmax(next_qvalues_online[index])  # online selects
+                future_reward = next_qvalues_list[index][best_next_action]   # target evaluates
                 desired_q = reward + self.discount_factor * future_reward
             else:
                 desired_q = reward
 
+            td_errors.append(abs(desired_q - old_q) + self.per_epsilon)
             current_q_values[action] = desired_q
             x_train.append(current_state)
             y_train.append(current_q_values)
 
-        x_train = numpy.array(x_train)
-        y_train = numpy.array(y_train)
-        x_train = numpy.reshape(x_train, [len(data_in_mini_batch), self.state_size])
-        y_train = numpy.reshape(y_train, [len(data_in_mini_batch), self.action_size])
+        x_train = numpy.reshape(numpy.array(x_train), [self.batch_size, self.state_size])
+        y_train = numpy.reshape(numpy.array(y_train), [self.batch_size, self.action_size])
 
         self.model.fit(
             self.tf.convert_to_tensor(x_train, self.tf.float32),
             self.tf.convert_to_tensor(y_train, self.tf.float32),
-            batch_size=self.batch_size, verbose=0
+            batch_size=self.batch_size,
+            sample_weight=self.tf.convert_to_tensor(is_weights, self.tf.float32),
+            verbose=0
         )
+
+        # Update priorities with new TD errors
+        for idx, td_err in zip(indices, td_errors):
+            self.priorities[idx] = td_err
+
         self.target_update_after_counter += 1
 
         if self.target_update_after_counter > self.update_target_after and terminal:

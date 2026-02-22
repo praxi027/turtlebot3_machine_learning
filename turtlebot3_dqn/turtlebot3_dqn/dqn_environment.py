@@ -306,9 +306,11 @@ class RLEnvironment(Node):
     def calculate_reward(self):
         yaw_reward = 1 - (2 * abs(self.goal_angle) / math.pi)
         obstacle_reward = self.compute_weighted_obstacle_reward()
+        distance_delta = self.prev_goal_distance - self.goal_distance
 
-        print('directional_reward: %f, obstacle_reward: %f' % (yaw_reward, obstacle_reward))
-        reward = yaw_reward + obstacle_reward
+        print('directional_reward: %f, obstacle_reward: %f, distance_delta: %f' % (
+            yaw_reward, obstacle_reward, distance_delta))
+        reward = yaw_reward + obstacle_reward + 5.0 * distance_delta
 
         if self.succeed:
             reward = 100.0
@@ -338,6 +340,7 @@ class RLEnvironment(Node):
 
         response.state = self.calculate_state()
         response.reward = self.calculate_reward()
+        self.prev_goal_distance = self.goal_distance
         response.done = self.done
 
         if self.done is True:
