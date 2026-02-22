@@ -234,7 +234,7 @@ class DQNAgent(Node):
             score = 0
             sum_max_q = 0.0
 
-            time.sleep(0.2)
+            time.sleep(1.0)
 
             while True:
                 local_step += 1
