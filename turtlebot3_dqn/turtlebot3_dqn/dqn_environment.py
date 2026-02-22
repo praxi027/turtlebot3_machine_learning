@@ -229,7 +229,7 @@ class RLEnvironment(Node):
         state = []
         state.append(float(self.goal_distance))
         state.append(float(self.goal_angle))
-        for var in self.front_ranges:
+        for var in self.scan_ranges:
             state.append(float(var))
         self.local_step += 1
 
@@ -321,13 +321,15 @@ class RLEnvironment(Node):
 
     def rl_agent_interface_callback(self, request, response):
         action = request.action
+        linear_speed = 0.2 * min(1.0, max(0.0,
+            (self.front_min_obstacle_distance - 0.15) / (0.5 - 0.15)))
         if ROS_DISTRO == 'humble':
             msg = Twist()
-            msg.linear.x = 0.2
+            msg.linear.x = linear_speed
             msg.angular.z = self.angular_vel[action]
         else:
             msg = TwistStamped()
-            msg.twist.linear.x = 0.2
+            msg.twist.linear.x = linear_speed
             msg.twist.angular.z = self.angular_vel[action]
 
         self.cmd_vel_pub.publish(msg)

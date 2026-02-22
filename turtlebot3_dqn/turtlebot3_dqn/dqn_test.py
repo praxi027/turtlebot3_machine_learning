@@ -47,7 +47,7 @@ class DQNTest(Node):
         )
         self.get_logger().info(f'Using device: {self.device}')
 
-        self.state_size = 26
+        self.state_size = 50
         self.action_size = 5
 
         if not model_file:
