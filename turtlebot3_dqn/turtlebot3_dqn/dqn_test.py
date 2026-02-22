@@ -17,7 +17,6 @@
 #
 # Authors: Ryan Shim, Gilbert, ChanHyeong Lee, Hyungyu Kim
 
-import collections
 import os
 import sys
 import time
@@ -25,56 +24,11 @@ import time
 import numpy
 import rclpy
 from rclpy.node import Node
+import torch
 
 from turtlebot3_msgs.srv import Dqn
 
-_tensorflow = None
-_Dense = None
-_MeanSquaredError = None
-_load_model = None
-_Sequential = None
-_RMSprop = None
-
-
-def _import_tensorflow():
-    """Lazy import TensorFlow and Keras modules."""
-    try:
-        import tensorflow
-        from tensorflow.keras.layers import Dense
-        from tensorflow.keras.losses import MeanSquaredError
-        from tensorflow.keras.models import load_model
-        from tensorflow.keras.models import Sequential
-        from tensorflow.keras.optimizers import RMSprop
-        return (
-            tensorflow,
-            Dense,
-            MeanSquaredError,
-            load_model,
-            Sequential,
-            RMSprop
-        )
-    except ImportError as e:
-        print(f'Error importing TensorFlow: {e}', file=sys.stderr)
-        print('Please ensure TensorFlow is properly installed.', file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f'Fatal error during TensorFlow import: {e}', file=sys.stderr)
-        print(
-            'This may be due to missing system libraries or incompatible versions.',
-            file=sys.stderr)
-        sys.exit(1)
-
-
-def _ensure_tensorflow():
-    """Ensure TensorFlow is imported and stored in global variables."""
-    global _tensorflow, _Dense, _MeanSquaredError, _load_model, _Sequential, _RMSprop
-    if _tensorflow is None:
-        (_tensorflow,
-         _Dense,
-         _MeanSquaredError,
-         _load_model,
-         _Sequential,
-         _RMSprop) = _import_tensorflow()
+from turtlebot3_dqn.dqn_agent import QNetwork
 
 
 class DQNTest(Node):
@@ -88,59 +42,37 @@ class DQNTest(Node):
         use_gpu = self.get_parameter('use_gpu').get_parameter_value().bool_value
         self.verbose = self.get_parameter('verbose').get_parameter_value().bool_value
 
-        # Lazy import TensorFlow and store as instance variables
-        _ensure_tensorflow()
-        self.tf = _tensorflow
-        self.Dense = _Dense
-        self.MeanSquaredError = _MeanSquaredError
-        self.load_model = _load_model
-        self.Sequential = _Sequential
-        self.RMSprop = _RMSprop
-
-        if not use_gpu:
-            self.tf.config.set_visible_devices([], 'GPU')
+        self.device = torch.device(
+            'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
+        )
+        self.get_logger().info(f'Using device: {self.device}')
 
         self.state_size = 26
         self.action_size = 5
 
-        self.memory = collections.deque(maxlen=1000000)
+        if not model_file:
+            self.get_logger().error('model_file parameter is required')
+            sys.exit(1)
 
-        self.model = self.build_model()
         model_path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
             'saved_model',
             model_file
         )
 
-        loaded_model = self.load_model(
-            model_path, compile=False, custom_objects={'mse': self.MeanSquaredError()}
-        )
-        self.model.set_weights(loaded_model.get_weights())
+        self.model = QNetwork(self.state_size, self.action_size).to(self.device)
+        checkpoint = torch.load(model_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state'])
+        self.model.eval()
 
         self.rl_agent_interface_client = self.create_client(Dqn, 'rl_agent_interface')
 
         self.run_test()
 
-    def build_model(self):
-        model = self.Sequential()
-        model.add(self.Dense(
-            512, input_shape=(self.state_size,),
-            activation='relu',
-            kernel_initializer='lecun_uniform'
-        ))
-        model.add(self.Dense(256, activation='relu', kernel_initializer='lecun_uniform'))
-        model.add(self.Dense(128, activation='relu', kernel_initializer='lecun_uniform'))
-        model.add(
-            self.Dense(
-                self.action_size,
-                activation='linear',
-                kernel_initializer='lecun_uniform'))
-        model.compile(loss=self.MeanSquaredError(), optimizer=self.RMSprop(learning_rate=0.00025))
-        return model
-
     def get_action(self, state):
-        state = numpy.asarray(state)
-        q_values = self.model.predict(state.reshape(1, -1), verbose=self.verbose)
+        state_t = torch.FloatTensor(numpy.asarray(state).reshape(1, -1)).to(self.device)
+        with torch.no_grad():
+            q_values = self.model(state_t).cpu().numpy()
         return int(numpy.argmax(q_values[0]))
 
     def run_test(self):

@@ -25,10 +25,9 @@ setup(
     install_requires=[
         'setuptools',
         'launch',
-        'tensorflow==2.19.0',
+        'torch',
         'numpy==1.26.4',
         'scipy==1.10.1',
-        'keras==3.9.2',
     ],
     zip_safe=True,
     author=authors,
