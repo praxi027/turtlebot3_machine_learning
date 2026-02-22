@@ -108,3 +108,6 @@ venv.bak/
 /docker_setup/backup
 *.idea
 *.log
+*.h5
+*.json
+*.pt
