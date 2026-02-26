@@ -43,7 +43,7 @@ current_time = datetime.datetime.now().strftime('[%mm%dd-%H:%M]')
 # Action bounds
 LINEAR_VEL_MIN = 0.0
 LINEAR_VEL_MAX = 0.22
-ANGULAR_VEL_MAX = 1.5
+ANGULAR_VEL_MAX = 2.84
 
 
 class ActorCritic(nn.Module):

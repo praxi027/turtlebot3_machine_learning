@@ -268,49 +268,31 @@ class RLEnvironment(Node):
 
         return state
 
-    def compute_directional_weights(self, relative_angles, max_weight=10.0):
-        power = 6
-        raw_weights = (numpy.cos(relative_angles)) ** power + 0.1
-        scaled_weights = raw_weights * (max_weight / numpy.max(raw_weights))
-        normalized_weights = scaled_weights / numpy.sum(scaled_weights)
-        return normalized_weights
-
-    def compute_weighted_obstacle_reward(self):
-        if not self.front_ranges or not self.front_angles:
-            return 0.0
-
-        front_ranges = numpy.array(self.front_ranges)
-        front_angles = numpy.array(self.front_angles)
-
-        valid_mask = front_ranges <= 0.5
-        if not numpy.any(valid_mask):
-            return 0.0
-
-        front_ranges = front_ranges[valid_mask]
-        front_angles = front_angles[valid_mask]
-
-        relative_angles = numpy.unwrap(front_angles)
-        relative_angles[relative_angles > numpy.pi] -= 2 * numpy.pi
-
-        weights = self.compute_directional_weights(relative_angles, max_weight=10.0)
-
-        safe_dists = numpy.clip(front_ranges - 0.25, 1e-2, 3.5)
-        decay = numpy.exp(-3.0 * safe_dists)
-
-        weighted_decay = numpy.dot(weights, decay)
-
-        reward = -(1.0 + 4.0 * weighted_decay)
-
-        return reward
-
     def calculate_reward(self):
-        yaw_reward = 1 - (2 * abs(self.goal_angle) / math.pi)
-        obstacle_reward = self.compute_weighted_obstacle_reward()
+        # Progress toward goal — primary learning signal
         distance_delta = self.prev_goal_distance - self.goal_distance
+        progress_reward = 5.0 * distance_delta
 
-        print('yaw_reward: %f, obstacle_reward: %f, distance_delta: %f' % (
-            yaw_reward, obstacle_reward, distance_delta))
-        reward = yaw_reward + obstacle_reward + 5.0 * distance_delta
+        # Heading alignment — reduced weight (0.5) so the robot can look away
+        # from the goal when navigating around walls or obstacles
+        yaw_reward = 0.5 * (1.0 - 2.0 * abs(self.goal_angle) / math.pi)
+
+        # 360° omnidirectional safety penalty using the closest ray from any
+        # direction. Quadratic curve: 0 at 0.6 m, -5 at the 0.15 m collision
+        # threshold. Critical for wall avoidance and lateral/rear obstacle detection.
+        d = self.min_obstacle_distance
+        safe_dist = 0.6
+        danger_dist = 0.15
+        if d < safe_dist:
+            ratio = (safe_dist - d) / (safe_dist - danger_dist)
+            obstacle_reward = -5.0 * ratio ** 2
+        else:
+            obstacle_reward = 0.0
+
+        print('progress: %.3f  yaw: %.3f  obstacle: %.3f' % (
+            progress_reward, yaw_reward, obstacle_reward))
+
+        reward = progress_reward + yaw_reward + obstacle_reward
 
         if self.succeed:
             reward = 100.0
@@ -322,7 +304,7 @@ class RLEnvironment(Node):
     def rl_agent_interface_callback(self, request, response):
         # Continuous actions: request.action = [linear_vel, angular_vel]
         linear_vel = float(numpy.clip(request.action[0], 0.0, 0.22))
-        angular_vel = float(numpy.clip(request.action[1], -1.5, 1.5))
+        angular_vel = float(numpy.clip(request.action[1], -2.84, 2.84))
 
         if ROS_DISTRO == 'humble':
             msg = Twist()
