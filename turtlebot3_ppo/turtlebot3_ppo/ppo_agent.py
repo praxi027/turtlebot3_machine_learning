@@ -453,7 +453,7 @@ class PPOAgent(Node):
                     if episode >= self.max_training_episodes:
                         break
 
-                time.sleep(0.01)
+                time.sleep(0.001)
 
             # Bootstrap last value for GAE
             self.model.eval()
