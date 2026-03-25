@@ -22,6 +22,7 @@
 import datetime
 import os
 import time
+from collections import deque
 
 import numpy
 import rclpy
@@ -220,7 +221,7 @@ class PPOAgent(Node):
                 home_dir, 'turtlebot3_ppo_logs', 'gradient_tape',
                 current_time + ' ppo_reward'
             )
-            self.writer = SummaryWriter(log_dir)
+            self.writer = SummaryWriter(log_dir, flush_secs=30)
 
         # ROS clients and publishers
         self.rl_agent_interface_client = self.create_client(Ppo, 'rl_agent_interface')
@@ -330,6 +331,8 @@ class PPOAgent(Node):
         total_policy_loss = 0.0
         total_value_loss = 0.0
         total_entropy = 0.0
+        total_clip_fraction = 0.0
+        total_approx_kl = 0.0
         num_updates = 0
 
         indices = numpy.arange(n)
@@ -373,13 +376,25 @@ class PPOAgent(Node):
                 total_policy_loss += policy_loss.item()
                 total_value_loss += value_loss.item()
                 total_entropy += (-entropy_loss.item())
+                with torch.no_grad():
+                    clip_frac = ((ratio - 1.0).abs() > self.clip_epsilon).float().mean().item()
+                    approx_kl = ((ratio - 1.0) - torch.log(ratio)).mean().item()
+                total_clip_fraction += clip_frac
+                total_approx_kl += approx_kl
                 num_updates += 1
 
         if num_updates > 0:
-            return (total_policy_loss / num_updates,
-                    total_value_loss / num_updates,
-                    total_entropy / num_updates)
-        return 0.0, 0.0, 0.0
+            return {
+                'policy_loss': total_policy_loss / num_updates,
+                'value_loss': total_value_loss / num_updates,
+                'entropy': total_entropy / num_updates,
+                'clip_fraction': total_clip_fraction / num_updates,
+                'approx_kl': total_approx_kl / num_updates,
+            }
+        return {
+            'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0,
+            'clip_fraction': 0.0, 'approx_kl': 0.0,
+        }
 
     # ------------------------------------------------------------------
     # Main training loop
@@ -394,6 +409,10 @@ class PPOAgent(Node):
         ep_reward = 0.0
         ep_steps = 0
         rollout_num = 0
+
+        # Rolling trackers for episode-level metrics
+        recent_rewards = deque(maxlen=100)
+        recent_outcomes = deque(maxlen=100)  # 'success', 'collision', 'timeout'
 
         state = self.reset_environment()
         time.sleep(1.0)
@@ -434,14 +453,48 @@ class PPOAgent(Node):
 
                 if done:
                     episode += 1
+
+                    # Classify outcome from state
+                    goal_dist = float(next_state[0][0])
+                    min_lidar = float(numpy.min(next_state[0][2:]))
+                    if goal_dist < 0.20:
+                        outcome = 'success'
+                    elif min_lidar < 0.15:
+                        outcome = 'collision'
+                    else:
+                        outcome = 'timeout'
+
+                    recent_rewards.append(ep_reward)
+                    recent_outcomes.append(outcome)
+
                     print(
                         'Episode:', episode,
                         '| reward:', round(ep_reward, 2),
-                        '| steps:', ep_steps
+                        '| steps:', ep_steps,
+                        '| outcome:', outcome
                     )
 
                     if LOGGING:
                         self.writer.add_scalar('ppo/episode_reward', ep_reward, episode)
+                        self.writer.add_scalar('ppo/episode_length', ep_steps, episode)
+                        self.writer.add_scalar('ppo/goal_distance_at_end', goal_dist, episode)
+                        n = len(recent_outcomes)
+                        self.writer.add_scalar(
+                            'ppo/success_rate',
+                            sum(1 for o in recent_outcomes if o == 'success') / n,
+                            episode)
+                        self.writer.add_scalar(
+                            'ppo/collision_rate',
+                            sum(1 for o in recent_outcomes if o == 'collision') / n,
+                            episode)
+                        self.writer.add_scalar(
+                            'ppo/timeout_rate',
+                            sum(1 for o in recent_outcomes if o == 'timeout') / n,
+                            episode)
+                        self.writer.add_scalar(
+                            'ppo/episode_reward_mean100',
+                            sum(recent_rewards) / len(recent_rewards),
+                            episode)
 
                     ep_reward = 0.0
                     ep_steps = 0
@@ -464,14 +517,32 @@ class PPOAgent(Node):
 
             # === PPO UPDATE ===
             advantages, returns = self.compute_gae(last_value)
-            policy_loss, value_loss, entropy = self.ppo_update(advantages, returns)
+
+            # Explained variance: how well the value function predicts returns
+            values_np = numpy.array(self.buffer.values)
+            returns_np = numpy.array(returns, dtype=numpy.float32)
+            var_returns = numpy.var(returns_np)
+            if var_returns > 1e-8:
+                explained_var = 1.0 - numpy.var(returns_np - values_np) / var_returns
+            else:
+                explained_var = 0.0
+
+            rollout_start_time = time.time()
+            metrics = self.ppo_update(advantages, returns)
+            update_time = time.time() - rollout_start_time
             rollout_num += 1
+
+            policy_loss = metrics['policy_loss']
+            value_loss = metrics['value_loss']
+            entropy = metrics['entropy']
 
             print(
                 'Rollout:', rollout_num,
                 '| policy_loss:', round(policy_loss, 4),
                 '| value_loss:', round(value_loss, 4),
-                '| entropy:', round(entropy, 4)
+                '| entropy:', round(entropy, 4),
+                '| clip_frac:', round(metrics['clip_fraction'], 4),
+                '| expl_var:', round(explained_var, 4)
             )
 
             # Publish rollout metrics
@@ -483,6 +554,13 @@ class PPOAgent(Node):
                 self.writer.add_scalar('ppo/policy_loss', policy_loss, rollout_num)
                 self.writer.add_scalar('ppo/value_loss', value_loss, rollout_num)
                 self.writer.add_scalar('ppo/entropy', entropy, rollout_num)
+                self.writer.add_scalar('ppo/clip_fraction', metrics['clip_fraction'], rollout_num)
+                self.writer.add_scalar('ppo/approx_kl', metrics['approx_kl'], rollout_num)
+                self.writer.add_scalar('ppo/explained_variance', explained_var, rollout_num)
+                self.writer.add_scalar('ppo/learning_rate', self.learning_rate, rollout_num)
+                with torch.no_grad():
+                    std_mean = self.model.log_std.exp().mean().item()
+                self.writer.add_scalar('ppo/action_std', std_mean, rollout_num)
 
     def _save_model(self, episode):
         idx = 1
