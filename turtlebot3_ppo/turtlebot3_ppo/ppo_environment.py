@@ -25,6 +25,7 @@
 
 import math
 import os
+import time
 
 from geometry_msgs.msg import Twist
 from geometry_msgs.msg import TwistStamped
@@ -32,9 +33,12 @@ from nav_msgs.msg import Odometry
 import numpy
 import rclpy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
 from rclpy.node import Node
 from rclpy.qos import qos_profile_sensor_data
 from rclpy.qos import QoSProfile
+from rosgraph_msgs.msg import Clock
 from sensor_msgs.msg import LaserScan
 from std_srvs.srv import Empty
 
@@ -43,6 +47,13 @@ from turtlebot3_msgs.srv import Ppo
 
 
 ROS_DISTRO = os.environ.get('ROS_DISTRO')
+
+
+def wait_for_future(future):
+    """Wait for an async service call to complete (MultiThreadedExecutor-safe)."""
+    while not future.done():
+        time.sleep(0.01)
+    return future.result()
 
 
 class RLEnvironment(Node):
@@ -71,6 +82,11 @@ class RLEnvironment(Node):
         self.local_step = 0
         self.stop_cmd_vel_timer = None
 
+        # Fixed control period in sim time (seconds).
+        # At 10 Hz: 800 steps = 80 s of sim time regardless of real_time_factor.
+        self.control_period = 0.1
+        self.sim_time = 0.0
+
         qos = QoSProfile(depth=10)
 
         if ROS_DISTRO == 'humble':
@@ -78,17 +94,30 @@ class RLEnvironment(Node):
         else:
             self.cmd_vel_pub = self.create_publisher(TwistStamped, 'cmd_vel', qos)
 
+        # Sensor and clock subs in ReentrantCallbackGroup so they can fire
+        # while the service callback is waiting for the control period.
+        self.sensor_cb_group = ReentrantCallbackGroup()
+
         self.odom_sub = self.create_subscription(
             Odometry,
             'odom',
             self.odom_sub_callback,
-            qos
+            qos,
+            callback_group=self.sensor_cb_group
         )
         self.scan_sub = self.create_subscription(
             LaserScan,
             'scan',
             self.scan_sub_callback,
-            qos_profile_sensor_data
+            qos_profile_sensor_data,
+            callback_group=self.sensor_cb_group
+        )
+        self.clock_sub = self.create_subscription(
+            Clock,
+            '/clock',
+            self.clock_callback,
+            qos_profile_sensor_data,
+            callback_group=self.sensor_cb_group
         )
 
         self.clients_callback_group = MutuallyExclusiveCallbackGroup()
@@ -131,8 +160,7 @@ class RLEnvironment(Node):
                 'service for initialize the environment is not available, waiting ...'
             )
         future = self.initialize_environment_client.call_async(Goal.Request())
-        rclpy.spin_until_future_complete(self, future)
-        response_goal = future.result()
+        response_goal = wait_for_future(future)
         if not response_goal.success:
             self.get_logger().error('initialize environment request failed')
         else:
@@ -156,11 +184,10 @@ class RLEnvironment(Node):
         while not self.task_succeed_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn('service for task succeed is not available, waiting ...')
         future = self.task_succeed_client.call_async(Goal.Request())
-        rclpy.spin_until_future_complete(self, future)
-        if future.result() is not None:
-            response = future.result()
-            self.goal_pose_x = response.pose_x
-            self.goal_pose_y = response.pose_y
+        result = wait_for_future(future)
+        if result is not None:
+            self.goal_pose_x = result.pose_x
+            self.goal_pose_y = result.pose_y
             self.get_logger().info('service for task succeed finished')
         else:
             self.get_logger().error('task succeed service call failed')
@@ -169,14 +196,16 @@ class RLEnvironment(Node):
         while not self.task_failed_client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn('service for task failed is not available, waiting ...')
         future = self.task_failed_client.call_async(Goal.Request())
-        rclpy.spin_until_future_complete(self, future)
-        if future.result() is not None:
-            response = future.result()
-            self.goal_pose_x = response.pose_x
-            self.goal_pose_y = response.pose_y
+        result = wait_for_future(future)
+        if result is not None:
+            self.goal_pose_x = result.pose_x
+            self.goal_pose_y = result.pose_y
             self.get_logger().info('service for task failed finished')
         else:
             self.get_logger().error('task failed service call failed')
+
+    def clock_callback(self, msg):
+        self.sim_time = msg.clock.sec + msg.clock.nanosec * 1e-9
 
     def scan_sub_callback(self, scan):
         self.scan_ranges = []
@@ -323,6 +352,12 @@ class RLEnvironment(Node):
             self.destroy_timer(self.stop_cmd_vel_timer)
             self.stop_cmd_vel_timer = self.create_timer(0.8, self.timer_callback)
 
+        # Wait for control_period of sim time so the robot actually moves.
+        # Works at any real_time_factor (including 0 = as fast as possible).
+        target_sim_time = self.sim_time + self.control_period
+        while self.sim_time < target_sim_time:
+            time.sleep(0.001)
+
         response.state = self.calculate_state()
         response.reward = self.calculate_reward()
         self.prev_goal_distance = self.goal_distance
@@ -366,9 +401,10 @@ class RLEnvironment(Node):
 def main(args=None):
     rclpy.init(args=args)
     rl_environment = RLEnvironment()
+    executor = MultiThreadedExecutor(num_threads=4)
+    executor.add_node(rl_environment)
     try:
-        while rclpy.ok():
-            rclpy.spin_once(rl_environment, timeout_sec=0.1)
+        executor.spin()
     except KeyboardInterrupt:
         pass
     finally:
