@@ -454,13 +454,14 @@ class PPOAgent(Node):
                 if done:
                     episode += 1
 
-                    # Classify outcome from state
+                    # Classify outcome using reward (the environment already
+                    # determined success/failure; state may reflect the next goal).
                     goal_dist = float(next_state[0][0])
-                    min_lidar = float(numpy.min(next_state[0][2:]))
-                    if goal_dist < 0.20:
+                    if reward == 100.0:
                         outcome = 'success'
-                    elif min_lidar < 0.15:
-                        outcome = 'collision'
+                    elif reward == -50.0:
+                        min_lidar = float(numpy.min(next_state[0][2:]))
+                        outcome = 'collision' if min_lidar < 0.20 else 'timeout'
                     else:
                         outcome = 'timeout'
 
