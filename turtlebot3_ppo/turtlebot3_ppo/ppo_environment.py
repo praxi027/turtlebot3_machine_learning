@@ -318,10 +318,13 @@ class RLEnvironment(Node):
         else:
             obstacle_reward = 0.0
 
-        print('progress: %.3f  yaw: %.3f  obstacle: %.3f' % (
-            progress_reward, yaw_reward, obstacle_reward))
+        # Small per-step time penalty to discourage slow wandering / timeouts
+        time_penalty = -0.1
 
-        reward = progress_reward + yaw_reward + obstacle_reward
+        print('progress: %.3f  yaw: %.3f  obstacle: %.3f  time: %.3f' % (
+            progress_reward, yaw_reward, obstacle_reward, time_penalty))
+
+        reward = progress_reward + yaw_reward + obstacle_reward + time_penalty
 
         if self.succeed:
             reward = 100.0

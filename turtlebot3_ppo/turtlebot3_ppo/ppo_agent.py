@@ -185,14 +185,15 @@ class PPOAgent(Node):
         # PPO hyperparameters
         self.gamma = 0.99
         self.gae_lambda = 0.95
-        self.clip_epsilon = 0.2
+        self.clip_epsilon = 0.15
         self.learning_rate = 3e-4
         self.rollout_steps = 2048
-        self.n_epochs = 10
+        self.n_epochs = 4
         self.minibatch_size = 64
         self.value_coeff = 0.5
         self.entropy_coeff = 0.01
         self.max_grad_norm = 0.5
+        self.target_kl = 0.02
         self.save_interval = 100
 
         # Network and optimiser
@@ -336,7 +337,10 @@ class PPOAgent(Node):
         num_updates = 0
 
         indices = numpy.arange(n)
-        for _ in range(self.n_epochs):
+        early_stopped = False
+        for epoch in range(self.n_epochs):
+            if early_stopped:
+                break
             numpy.random.shuffle(indices)
             for start in range(0, n, self.minibatch_size):
                 mb_idx = indices[start:start + self.minibatch_size]
@@ -382,6 +386,10 @@ class PPOAgent(Node):
                 total_clip_fraction += clip_frac
                 total_approx_kl += approx_kl
                 num_updates += 1
+
+                if approx_kl > self.target_kl:
+                    early_stopped = True
+                    break
 
         if num_updates > 0:
             return {
