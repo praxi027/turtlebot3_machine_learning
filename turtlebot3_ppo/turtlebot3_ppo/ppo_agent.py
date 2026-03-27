@@ -185,15 +185,14 @@ class PPOAgent(Node):
         # PPO hyperparameters
         self.gamma = 0.99
         self.gae_lambda = 0.95
-        self.clip_epsilon = 0.15
+        self.clip_epsilon = 0.2
         self.learning_rate = 3e-4
         self.rollout_steps = 2048
-        self.n_epochs = 4
+        self.n_epochs = 10
         self.minibatch_size = 64
         self.value_coeff = 0.5
         self.entropy_coeff = 0.01
         self.max_grad_norm = 0.5
-        self.target_kl = 0.02
         self.save_interval = 100
 
         # Network and optimiser
@@ -223,6 +222,7 @@ class PPOAgent(Node):
                 current_time + ' ppo_reward'
             )
             self.writer = SummaryWriter(log_dir, flush_secs=30)
+            self._save_config(log_dir)
 
         # ROS clients and publishers
         self.rl_agent_interface_client = self.create_client(Ppo, 'rl_agent_interface')
@@ -337,10 +337,7 @@ class PPOAgent(Node):
         num_updates = 0
 
         indices = numpy.arange(n)
-        early_stopped = False
-        for epoch in range(self.n_epochs):
-            if early_stopped:
-                break
+        for _ in range(self.n_epochs):
             numpy.random.shuffle(indices)
             for start in range(0, n, self.minibatch_size):
                 mb_idx = indices[start:start + self.minibatch_size]
@@ -386,10 +383,6 @@ class PPOAgent(Node):
                 total_clip_fraction += clip_frac
                 total_approx_kl += approx_kl
                 num_updates += 1
-
-                if approx_kl > self.target_kl:
-                    early_stopped = True
-                    break
 
         if num_updates > 0:
             return {
@@ -570,6 +563,27 @@ class PPOAgent(Node):
                 with torch.no_grad():
                     std_mean = self.model.log_std.exp().mean().item()
                 self.writer.add_scalar('ppo/action_std', std_mean, rollout_num)
+
+    def _save_config(self, log_dir):
+        """Write hyperparameters to config.txt inside the TensorBoard log dir."""
+        config_path = os.path.join(log_dir, 'config.txt')
+        with open(config_path, 'w') as f:
+            f.write(f'Date: {current_time}\n')
+            f.write(f'Max episodes: {self.max_training_episodes}\n')
+            f.write(f'Device: {self.device}\n\n')
+            f.write('=== PPO Hyperparameters ===\n')
+            for name in ['gamma', 'gae_lambda', 'clip_epsilon', 'learning_rate',
+                         'rollout_steps', 'n_epochs', 'minibatch_size',
+                         'value_coeff', 'entropy_coeff', 'max_grad_norm']:
+                f.write(f'{name} = {getattr(self, name)}\n')
+            with torch.no_grad():
+                log_std = self.model.log_std.tolist()
+            f.write(f'log_std_init = {log_std}\n')
+            f.write(f'\n=== Network ===\n')
+            f.write(f'state_size = {self.state_size}\n')
+            f.write(f'action_size = {self.action_size}\n')
+            f.write(f'{self.model}\n')
+        self.get_logger().info(f'Config saved: {config_path}')
 
     def _save_model(self, episode):
         idx = 1
