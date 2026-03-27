@@ -38,13 +38,7 @@ from torch.utils.tensorboard import SummaryWriter
 from turtlebot3_msgs.srv import Ppo
 
 
-LOGGING = True
 current_time = datetime.datetime.now().strftime('[%mm%dd-%H:%M]')
-
-# Action bounds
-LINEAR_VEL_MIN = 0.0
-LINEAR_VEL_MAX = 0.22
-ANGULAR_VEL_MAX = 2.84
 
 
 class ActorCritic(nn.Module):
@@ -60,8 +54,10 @@ class ActorCritic(nn.Module):
       angular_vel = 1.5  * tanh(raw[1])          -> [-1.5, 1.5] rad/s
     """
 
-    def __init__(self, state_size=50, action_size=2):
+    def __init__(self, state_size=50, action_size=2, angular_vel_max=2.84):
         super().__init__()
+        self.angular_vel_max = angular_vel_max
+
         self.backbone = nn.Sequential(
             nn.Linear(state_size, 512),
             nn.ReLU(),
@@ -115,11 +111,10 @@ class ActorCritic(nn.Module):
         _, value = self.forward(state)
         return value
 
-    @staticmethod
-    def _squash(action_raw):
+    def _squash(self, action_raw):
         """Map unbounded raw actions to [linear_min, linear_max] x [-angular_max, angular_max]."""
         linear = 0.11 + 0.11 * torch.tanh(action_raw[..., 0:1])   # [0.0, 0.22]
-        angular = ANGULAR_VEL_MAX * torch.tanh(action_raw[..., 1:2])  # [-1.5, 1.5]
+        angular = self.angular_vel_max * torch.tanh(action_raw[..., 1:2])
         return torch.cat([linear, angular], dim=-1)
 
 
@@ -165,6 +160,22 @@ class PPOAgent(Node):
         self.declare_parameter('model_file', '')
         self.declare_parameter('use_gpu', True)
         self.declare_parameter('verbose', True)
+        self.declare_parameter('experiment_name', '')
+        self.declare_parameter('logging', True)
+
+        # PPO hyperparameters (configurable via ROS2 parameters)
+        self.declare_parameter('gamma', 0.99)
+        self.declare_parameter('gae_lambda', 0.95)
+        self.declare_parameter('clip_epsilon', 0.2)
+        self.declare_parameter('learning_rate', 3e-4)
+        self.declare_parameter('rollout_steps', 2048)
+        self.declare_parameter('n_epochs', 10)
+        self.declare_parameter('minibatch_size', 64)
+        self.declare_parameter('value_coeff', 0.5)
+        self.declare_parameter('entropy_coeff', 0.01)
+        self.declare_parameter('max_grad_norm', 0.5)
+        self.declare_parameter('save_interval', 100)
+        self.declare_parameter('angular_vel_max', 2.84)
 
         self.max_training_episodes = self.get_parameter(
             'max_training_episodes'
@@ -172,6 +183,21 @@ class PPOAgent(Node):
         model_file = self.get_parameter('model_file').get_parameter_value().string_value
         use_gpu = self.get_parameter('use_gpu').get_parameter_value().bool_value
         self.verbose = self.get_parameter('verbose').get_parameter_value().bool_value
+        experiment_name = self.get_parameter('experiment_name').get_parameter_value().string_value
+        self.logging = self.get_parameter('logging').get_parameter_value().bool_value
+
+        self.gamma = self.get_parameter('gamma').get_parameter_value().double_value
+        self.gae_lambda = self.get_parameter('gae_lambda').get_parameter_value().double_value
+        self.clip_epsilon = self.get_parameter('clip_epsilon').get_parameter_value().double_value
+        self.learning_rate = self.get_parameter('learning_rate').get_parameter_value().double_value
+        self.rollout_steps = self.get_parameter('rollout_steps').get_parameter_value().integer_value
+        self.n_epochs = self.get_parameter('n_epochs').get_parameter_value().integer_value
+        self.minibatch_size = self.get_parameter('minibatch_size').get_parameter_value().integer_value
+        self.value_coeff = self.get_parameter('value_coeff').get_parameter_value().double_value
+        self.entropy_coeff = self.get_parameter('entropy_coeff').get_parameter_value().double_value
+        self.max_grad_norm = self.get_parameter('max_grad_norm').get_parameter_value().double_value
+        self.save_interval = self.get_parameter('save_interval').get_parameter_value().integer_value
+        self.angular_vel_max = self.get_parameter('angular_vel_max').get_parameter_value().double_value
 
         self.device = torch.device(
             'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
@@ -182,28 +208,21 @@ class PPOAgent(Node):
         self.state_size = 50
         self.action_size = 2  # [linear_vel, angular_vel]
 
-        # PPO hyperparameters
-        self.gamma = 0.99
-        self.gae_lambda = 0.95
-        self.clip_epsilon = 0.2
-        self.learning_rate = 3e-4
-        self.rollout_steps = 2048
-        self.n_epochs = 10
-        self.minibatch_size = 64
-        self.value_coeff = 0.5
-        self.entropy_coeff = 0.01
-        self.max_grad_norm = 0.5
-        self.save_interval = 100
-
         # Network and optimiser
-        self.model = ActorCritic(self.state_size, self.action_size).to(self.device)
+        self.model = ActorCritic(
+            self.state_size, self.action_size, angular_vel_max=self.angular_vel_max
+        ).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, eps=1e-5)
 
         # Model save directory
-        self.model_dir_path = os.path.join(
+        base_model_dir = os.path.join(
             os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
             'saved_model'
         )
+        if experiment_name:
+            self.model_dir_path = os.path.join(base_model_dir, experiment_name)
+        else:
+            self.model_dir_path = base_model_dir
         os.makedirs(self.model_dir_path, exist_ok=True)
 
         self.load_episode = 0
@@ -215,11 +234,14 @@ class PPOAgent(Node):
             self.get_logger().info(f'Loaded model from {model_path} (episode {self.load_episode})')
 
         # TensorBoard
-        if LOGGING:
+        if self.logging:
             home_dir = os.path.expanduser('~')
+            if experiment_name:
+                log_subdir = experiment_name
+            else:
+                log_subdir = current_time + ' ppo_reward'
             log_dir = os.path.join(
-                home_dir, 'turtlebot3_ppo_logs', 'gradient_tape',
-                current_time + ' ppo_reward'
+                home_dir, 'turtlebot3_ppo_logs', 'gradient_tape', log_subdir
             )
             self.writer = SummaryWriter(log_dir, flush_secs=30)
             self._save_config(log_dir)
@@ -476,7 +498,7 @@ class PPOAgent(Node):
                         '| outcome:', outcome
                     )
 
-                    if LOGGING:
+                    if self.logging:
                         self.writer.add_scalar('ppo/episode_reward', ep_reward, episode)
                         self.writer.add_scalar('ppo/episode_length', ep_steps, episode)
                         self.writer.add_scalar('ppo/goal_distance_at_end', goal_dist, episode)
@@ -552,7 +574,7 @@ class PPOAgent(Node):
             msg.data = [float(ep_reward), float(policy_loss), float(value_loss), float(entropy)]
             self.result_pub.publish(msg)
 
-            if LOGGING:
+            if self.logging:
                 self.writer.add_scalar('ppo/policy_loss', policy_loss, rollout_num)
                 self.writer.add_scalar('ppo/value_loss', value_loss, rollout_num)
                 self.writer.add_scalar('ppo/entropy', entropy, rollout_num)
@@ -574,7 +596,8 @@ class PPOAgent(Node):
             f.write('=== PPO Hyperparameters ===\n')
             for name in ['gamma', 'gae_lambda', 'clip_epsilon', 'learning_rate',
                          'rollout_steps', 'n_epochs', 'minibatch_size',
-                         'value_coeff', 'entropy_coeff', 'max_grad_norm']:
+                         'value_coeff', 'entropy_coeff', 'max_grad_norm',
+                         'angular_vel_max']:
                 f.write(f'{name} = {getattr(self, name)}\n')
             with torch.no_grad():
                 log_std = self.model.log_std.tolist()
