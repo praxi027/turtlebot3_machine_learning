@@ -60,12 +60,38 @@ class RLEnvironment(Node):
 
     def __init__(self):
         super().__init__('rl_environment')
+
+        # Reward parameters (configurable via ROS2 parameters)
+        self.declare_parameter('reward_progress_scale', 5.0)
+        self.declare_parameter('reward_yaw_scale', 0.5)
+        self.declare_parameter('reward_obstacle_scale', -5.0)
+        self.declare_parameter('reward_obstacle_safe_dist', 0.6)
+        self.declare_parameter('reward_obstacle_danger_dist', 0.15)
+        self.declare_parameter('reward_success', 100.0)
+        self.declare_parameter('reward_fail', -50.0)
+
+        # Environment parameters
+        self.declare_parameter('max_step', 800)
+        self.declare_parameter('goal_threshold', 0.20)
+        self.declare_parameter('collision_threshold', 0.15)
+        self.declare_parameter('angular_vel_max', 2.84)
+
+        self.reward_progress_scale = self.get_parameter('reward_progress_scale').get_parameter_value().double_value
+        self.reward_yaw_scale = self.get_parameter('reward_yaw_scale').get_parameter_value().double_value
+        self.reward_obstacle_scale = self.get_parameter('reward_obstacle_scale').get_parameter_value().double_value
+        self.reward_obstacle_safe_dist = self.get_parameter('reward_obstacle_safe_dist').get_parameter_value().double_value
+        self.reward_obstacle_danger_dist = self.get_parameter('reward_obstacle_danger_dist').get_parameter_value().double_value
+        self.reward_success = self.get_parameter('reward_success').get_parameter_value().double_value
+        self.reward_fail = self.get_parameter('reward_fail').get_parameter_value().double_value
+        self.max_step = self.get_parameter('max_step').get_parameter_value().integer_value
+        self.goal_threshold = self.get_parameter('goal_threshold').get_parameter_value().double_value
+        self.collision_threshold = self.get_parameter('collision_threshold').get_parameter_value().double_value
+        self.angular_vel_max = self.get_parameter('angular_vel_max').get_parameter_value().double_value
+
         self.goal_pose_x = 0.0
         self.goal_pose_y = 0.0
         self.robot_pose_x = 0.0
         self.robot_pose_y = 0.0
-
-        self.max_step = 800
 
         self.done = False
         self.fail = False
@@ -262,7 +288,7 @@ class RLEnvironment(Node):
             state.append(float(var))
         self.local_step += 1
 
-        if self.goal_distance < 0.20:
+        if self.goal_distance < self.goal_threshold:
             self.get_logger().info('Goal Reached')
             self.succeed = True
             self.done = True
@@ -273,7 +299,7 @@ class RLEnvironment(Node):
             self.local_step = 0
             self.call_task_succeed()
 
-        if self.min_obstacle_distance < 0.15:
+        if self.min_obstacle_distance < self.collision_threshold:
             self.get_logger().info('Collision happened')
             self.fail = True
             self.done = True
@@ -300,21 +326,20 @@ class RLEnvironment(Node):
     def calculate_reward(self):
         # Progress toward goal — primary learning signal
         distance_delta = self.prev_goal_distance - self.goal_distance
-        progress_reward = 5.0 * distance_delta
+        progress_reward = self.reward_progress_scale * distance_delta
 
-        # Heading alignment — reduced weight (0.5) so the robot can look away
+        # Heading alignment — reduced weight so the robot can look away
         # from the goal when navigating around walls or obstacles
-        yaw_reward = 0.5 * (1.0 - 2.0 * abs(self.goal_angle) / math.pi)
+        yaw_reward = self.reward_yaw_scale * (1.0 - 2.0 * abs(self.goal_angle) / math.pi)
 
         # 360° omnidirectional safety penalty using the closest ray from any
-        # direction. Quadratic curve: 0 at 0.6 m, -5 at the 0.15 m collision
-        # threshold. Critical for wall avoidance and lateral/rear obstacle detection.
+        # direction. Quadratic curve: 0 at safe_dist, reward_obstacle_scale at
+        # danger_dist. Critical for wall avoidance and lateral/rear obstacle detection.
         d = self.min_obstacle_distance
-        safe_dist = 0.6
-        danger_dist = 0.15
-        if d < safe_dist:
-            ratio = (safe_dist - d) / (safe_dist - danger_dist)
-            obstacle_reward = -5.0 * ratio ** 2
+        if d < self.reward_obstacle_safe_dist:
+            ratio = (self.reward_obstacle_safe_dist - d) / (
+                self.reward_obstacle_safe_dist - self.reward_obstacle_danger_dist)
+            obstacle_reward = self.reward_obstacle_scale * ratio ** 2
         else:
             obstacle_reward = 0.0
 
@@ -324,16 +349,16 @@ class RLEnvironment(Node):
         reward = progress_reward + yaw_reward + obstacle_reward
 
         if self.succeed:
-            reward = 100.0
+            reward = self.reward_success
         elif self.fail:
-            reward = -50.0
+            reward = self.reward_fail
 
         return reward
 
     def rl_agent_interface_callback(self, request, response):
         # Continuous actions: request.action = [linear_vel, angular_vel]
         linear_vel = float(numpy.clip(request.action[0], 0.0, 0.22))
-        angular_vel = float(numpy.clip(request.action[1], -2.84, 2.84))
+        angular_vel = float(numpy.clip(request.action[1], -self.angular_vel_max, self.angular_vel_max))
 
         if ROS_DISTRO == 'humble':
             msg = Twist()
