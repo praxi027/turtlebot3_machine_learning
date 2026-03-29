@@ -75,6 +75,7 @@ class RLEnvironment(Node):
         self.declare_parameter('goal_threshold', 0.20)
         self.declare_parameter('collision_threshold', 0.15)
         self.declare_parameter('angular_vel_max', 2.84)
+        self.declare_parameter('lyapunov_scale', 0.0)
 
         self.reward_progress_scale = self.get_parameter('reward_progress_scale').get_parameter_value().double_value
         self.reward_yaw_scale = self.get_parameter('reward_yaw_scale').get_parameter_value().double_value
@@ -87,6 +88,7 @@ class RLEnvironment(Node):
         self.goal_threshold = self.get_parameter('goal_threshold').get_parameter_value().double_value
         self.collision_threshold = self.get_parameter('collision_threshold').get_parameter_value().double_value
         self.angular_vel_max = self.get_parameter('angular_vel_max').get_parameter_value().double_value
+        self.lyapunov_scale = self.get_parameter('lyapunov_scale').get_parameter_value().double_value
 
         self.goal_pose_x = 0.0
         self.goal_pose_y = 0.0
@@ -346,7 +348,16 @@ class RLEnvironment(Node):
         print('progress: %.3f  yaw: %.3f  obstacle: %.3f' % (
             progress_reward, yaw_reward, obstacle_reward))
 
-        reward = progress_reward + yaw_reward + obstacle_reward
+        # Lyapunov potential-based reward shaping: γ·Φ(s') - Φ(s)
+        # where Φ(s) = -goal_distance. Theoretically preserves optimal policy
+        # (PBRS theorem) while accelerating learning.
+        if self.lyapunov_scale > 0.0:
+            lyapunov_reward = self.lyapunov_scale * (
+                0.99 * (-self.goal_distance) - (-self.prev_goal_distance))
+        else:
+            lyapunov_reward = 0.0
+
+        reward = progress_reward + yaw_reward + obstacle_reward + lyapunov_reward
 
         if self.succeed:
             reward = self.reward_success

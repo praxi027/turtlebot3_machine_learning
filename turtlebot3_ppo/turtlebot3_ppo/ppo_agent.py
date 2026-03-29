@@ -176,6 +176,7 @@ class PPOAgent(Node):
         self.declare_parameter('max_grad_norm', 0.5)
         self.declare_parameter('save_interval', 100)
         self.declare_parameter('angular_vel_max', 2.84)
+        self.declare_parameter('action_smoothing', 0.0)
 
         self.max_training_episodes = self.get_parameter(
             'max_training_episodes'
@@ -198,6 +199,7 @@ class PPOAgent(Node):
         self.max_grad_norm = self.get_parameter('max_grad_norm').get_parameter_value().double_value
         self.save_interval = self.get_parameter('save_interval').get_parameter_value().integer_value
         self.angular_vel_max = self.get_parameter('angular_vel_max').get_parameter_value().double_value
+        self.action_smoothing = self.get_parameter('action_smoothing').get_parameter_value().double_value
 
         self.device = torch.device(
             'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
@@ -439,6 +441,7 @@ class PPOAgent(Node):
 
         state = self.reset_environment()
         time.sleep(1.0)
+        prev_action = None  # for action smoothing EMA
 
         while episode < self.max_training_episodes:
             # === ROLLOUT COLLECTION ===
@@ -455,6 +458,12 @@ class PPOAgent(Node):
                 action_raw_np = action_raw.cpu().numpy()  # (1, 2) pre-tanh
                 log_prob_np = log_prob.cpu().item()
                 value_np = value.cpu().item()
+
+                # Action smoothing: EMA blends with previous action
+                if self.action_smoothing > 0.0 and prev_action is not None:
+                    alpha = self.action_smoothing
+                    action_np = (1.0 - alpha) * action_np + alpha * prev_action
+                prev_action = action_np.copy()
 
                 next_state, reward, done = self.step(action_np)
 
@@ -522,6 +531,7 @@ class PPOAgent(Node):
 
                     ep_reward = 0.0
                     ep_steps = 0
+                    prev_action = None
                     state = self.reset_environment()
 
                     if episode % self.save_interval == 0:
