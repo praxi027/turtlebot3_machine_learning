@@ -111,3 +111,7 @@ venv.bak/
 *.h5
 *.json
 *.pt
+
+# ROS2 build artifacts
+install/
+log/
