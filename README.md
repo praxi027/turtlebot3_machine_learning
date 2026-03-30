@@ -354,7 +354,7 @@ Displays episode reward, policy loss, and value loss in real time.
 **TensorBoard:**
 
 ```bash
-tensorboard --logdir turtlebot3_ppo/saved_model/
+tensorboard --logdir ~/turtlebot3_ppo_logs/gradient_tape/
 ```
 
 **DQN action viewer:**
