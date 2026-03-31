@@ -161,7 +161,10 @@ class PPOAgent(Node):
         self.declare_parameter('use_gpu', True)
         self.declare_parameter('verbose', True)
         self.declare_parameter('experiment_name', '')
+        self.declare_parameter('run_id', '')
         self.declare_parameter('logging', True)
+        self.declare_parameter('tensorboard_dir', '')
+        self.declare_parameter('checkpoint_dir', '')
 
         # PPO hyperparameters (configurable via ROS2 parameters)
         self.declare_parameter('gamma', 0.99)
@@ -185,7 +188,10 @@ class PPOAgent(Node):
         use_gpu = self.get_parameter('use_gpu').get_parameter_value().bool_value
         self.verbose = self.get_parameter('verbose').get_parameter_value().bool_value
         experiment_name = self.get_parameter('experiment_name').get_parameter_value().string_value
+        run_id = self.get_parameter('run_id').get_parameter_value().string_value
         self.logging = self.get_parameter('logging').get_parameter_value().bool_value
+        tensorboard_dir = self.get_parameter('tensorboard_dir').get_parameter_value().string_value
+        checkpoint_dir = self.get_parameter('checkpoint_dir').get_parameter_value().string_value
 
         self.gamma = self.get_parameter('gamma').get_parameter_value().double_value
         self.gae_lambda = self.get_parameter('gae_lambda').get_parameter_value().double_value
@@ -216,15 +222,25 @@ class PPOAgent(Node):
         ).to(self.device)
         self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, eps=1e-5)
 
-        # Model save directory
-        base_model_dir = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.realpath(__file__))),
-            'saved_model'
-        )
-        if experiment_name:
-            self.model_dir_path = os.path.join(base_model_dir, experiment_name)
+        run_experiment = experiment_name if experiment_name else 'default'
+        if checkpoint_dir or tensorboard_dir:
+            if checkpoint_dir:
+                self.model_dir_path = checkpoint_dir
+                self.run_dir = os.path.dirname(self.model_dir_path)
+            else:
+                self.run_dir = os.path.dirname(tensorboard_dir)
+                self.model_dir_path = os.path.join(self.run_dir, 'checkpoints')
         else:
-            self.model_dir_path = base_model_dir
+            if not run_id:
+                run_id = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            self.run_dir = os.path.join(
+                os.path.expanduser('~'),
+                'turtlebot3_runs',
+                'manual',
+                run_experiment,
+                run_id,
+            )
+            self.model_dir_path = os.path.join(self.run_dir, 'checkpoints')
         os.makedirs(self.model_dir_path, exist_ok=True)
 
         self.load_episode = 0
@@ -237,14 +253,11 @@ class PPOAgent(Node):
 
         # TensorBoard
         if self.logging:
-            home_dir = os.path.expanduser('~')
-            if experiment_name:
-                log_subdir = experiment_name
+            if tensorboard_dir:
+                log_dir = tensorboard_dir
             else:
-                log_subdir = current_time + ' ppo_reward'
-            log_dir = os.path.join(
-                home_dir, 'turtlebot3_ppo_logs', 'gradient_tape', log_subdir
-            )
+                log_dir = os.path.join(self.run_dir, 'tensorboard')
+            os.makedirs(log_dir, exist_ok=True)
             self.writer = SummaryWriter(log_dir, flush_secs=30)
             self._save_config(log_dir)
 
