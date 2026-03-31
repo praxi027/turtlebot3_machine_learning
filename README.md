@@ -326,7 +326,6 @@ Pre-trained PPO checkpoints are stored under `turtlebot3_ppo/saved_model/`:
 | `lower_angular/` | Reduced angular velocity bound |
 | `smaller_lr/` | `learning_rate = 1e-4` |
 | `more_episodes/` | Extended training |
-| `reward_tuning/` | Reward coefficient ablations |
 | `stage2_action_smoothing/` | `action_smoothing = 0.2`, stage 2 |
 | `stage2_baseline/` | Stage 2 reference |
 
