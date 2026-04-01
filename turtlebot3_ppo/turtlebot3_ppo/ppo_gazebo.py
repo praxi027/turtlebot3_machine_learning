@@ -44,11 +44,26 @@ class GazeboInterface(Node):
 
     def __init__(self, stage_num):
         super().__init__('ppo_gazebo_interface')
-        self.stage = int(stage_num)
+        self.scenario = str(stage_num)
+        self.custom_scenarios = {
+            'penalty_corridor': {
+                'goal_pose': (2.75, 1.15),
+                'reset_robot_on_success': True,
+            },
+        }
+        self.custom_scenario = self.custom_scenarios.get(self.scenario)
+        if self.custom_scenario is None and self.scenario.isdigit():
+            self.stage = int(self.scenario)
+        elif self.custom_scenario is not None:
+            self.stage = None
+        else:
+            raise ValueError(f'Unsupported PPO scenario: {self.scenario}')
 
         self.entity_name = 'goal_box'
         self.entity_pose_x = 0.5
         self.entity_pose_y = 0.0
+        if self.custom_scenario is not None:
+            self.entity_pose_x, self.entity_pose_y = self.custom_scenario['goal_pose']
 
         if ROS_DISTRO == 'humble':
             self.entity = None
@@ -211,6 +226,12 @@ class GazeboInterface(Node):
     def task_succeed_callback(self, request, response):
         self.delete_entity()
         time.sleep(0.2)
+        if self.custom_scenario is not None and self.custom_scenario.get('reset_robot_on_success', False):
+            if ROS_DISTRO == 'humble':
+                self.reset_simulation()
+            else:
+                self.reset_burger()
+            time.sleep(0.2)
         self.generate_goal_pose()
         time.sleep(0.2)
         self.spawn_entity()
@@ -250,6 +271,10 @@ class GazeboInterface(Node):
         return response
 
     def generate_goal_pose(self):
+        if self.custom_scenario is not None:
+            self.entity_pose_x, self.entity_pose_y = self.custom_scenario['goal_pose']
+            return
+
         if self.stage != 4:
             self.entity_pose_x = random.randrange(-21, 21) / 10
             self.entity_pose_y = random.randrange(-21, 21) / 10

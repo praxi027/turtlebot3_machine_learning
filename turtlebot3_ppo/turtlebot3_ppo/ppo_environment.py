@@ -69,6 +69,8 @@ class RLEnvironment(Node):
         self.declare_parameter('reward_obstacle_danger_dist', 0.15)
         self.declare_parameter('reward_success', 100.0)
         self.declare_parameter('reward_fail', -50.0)
+        self.declare_parameter('reward_strategy', 'legacy')
+        self.declare_parameter('penalty_zones', [''])
 
         # Environment parameters
         self.declare_parameter('max_step', 800)
@@ -84,11 +86,20 @@ class RLEnvironment(Node):
         self.reward_obstacle_danger_dist = self.get_parameter('reward_obstacle_danger_dist').get_parameter_value().double_value
         self.reward_success = self.get_parameter('reward_success').get_parameter_value().double_value
         self.reward_fail = self.get_parameter('reward_fail').get_parameter_value().double_value
+        self.reward_strategy = self.get_parameter('reward_strategy').get_parameter_value().string_value
+        penalty_zone_entries = self.get_parameter(
+            'penalty_zones'
+        ).get_parameter_value().string_array_value
         self.max_step = self.get_parameter('max_step').get_parameter_value().integer_value
         self.goal_threshold = self.get_parameter('goal_threshold').get_parameter_value().double_value
         self.collision_threshold = self.get_parameter('collision_threshold').get_parameter_value().double_value
         self.angular_vel_max = self.get_parameter('angular_vel_max').get_parameter_value().double_value
         self.lyapunov_scale = self.get_parameter('lyapunov_scale').get_parameter_value().double_value
+        self.penalty_zones = self.parse_penalty_zones(penalty_zone_entries)
+        if self.reward_strategy not in ('legacy', 'simple_zone'):
+            raise ValueError(
+                "reward_strategy must be either 'legacy' or 'simple_zone'"
+            )
 
         self.goal_pose_x = 0.0
         self.goal_pose_y = 0.0
@@ -329,35 +340,39 @@ class RLEnvironment(Node):
         # Progress toward goal — primary learning signal
         distance_delta = self.prev_goal_distance - self.goal_distance
         progress_reward = self.reward_progress_scale * distance_delta
+        zone_reward = self.calculate_penalty_zone_reward()
 
-        # Heading alignment — reduced weight so the robot can look away
-        # from the goal when navigating around walls or obstacles
-        yaw_reward = self.reward_yaw_scale * (1.0 - 2.0 * abs(self.goal_angle) / math.pi)
+        if self.reward_strategy == 'legacy':
+            # Heading alignment and near-obstacle shaping are kept for the
+            # original benchmark stages.
+            yaw_reward = self.reward_yaw_scale * (1.0 - 2.0 * abs(self.goal_angle) / math.pi)
 
-        # 360° omnidirectional safety penalty using the closest ray from any
-        # direction. Quadratic curve: 0 at safe_dist, reward_obstacle_scale at
-        # danger_dist. Critical for wall avoidance and lateral/rear obstacle detection.
-        d = self.min_obstacle_distance
-        if d < self.reward_obstacle_safe_dist:
-            ratio = (self.reward_obstacle_safe_dist - d) / (
-                self.reward_obstacle_safe_dist - self.reward_obstacle_danger_dist)
-            obstacle_reward = self.reward_obstacle_scale * ratio ** 2
+            d = self.min_obstacle_distance
+            if d < self.reward_obstacle_safe_dist:
+                ratio = (self.reward_obstacle_safe_dist - d) / (
+                    self.reward_obstacle_safe_dist - self.reward_obstacle_danger_dist)
+                obstacle_reward = self.reward_obstacle_scale * ratio ** 2
+            else:
+                obstacle_reward = 0.0
+
+            # Lyapunov potential-based reward shaping: γ·Φ(s') - Φ(s)
+            # where Φ(s) = -goal_distance. Theoretically preserves optimal policy
+            # (PBRS theorem) while accelerating learning.
+            if self.lyapunov_scale > 0.0:
+                lyapunov_reward = self.lyapunov_scale * (
+                    0.99 * (-self.goal_distance) - (-self.prev_goal_distance))
+            else:
+                lyapunov_reward = 0.0
+
+            reward = progress_reward + yaw_reward + obstacle_reward + lyapunov_reward + zone_reward
+            print(
+                'progress: %.3f  yaw: %.3f  obstacle: %.3f  zone: %.3f' % (
+                    progress_reward, yaw_reward, obstacle_reward, zone_reward
+                )
+            )
         else:
-            obstacle_reward = 0.0
-
-        print('progress: %.3f  yaw: %.3f  obstacle: %.3f' % (
-            progress_reward, yaw_reward, obstacle_reward))
-
-        # Lyapunov potential-based reward shaping: γ·Φ(s') - Φ(s)
-        # where Φ(s) = -goal_distance. Theoretically preserves optimal policy
-        # (PBRS theorem) while accelerating learning.
-        if self.lyapunov_scale > 0.0:
-            lyapunov_reward = self.lyapunov_scale * (
-                0.99 * (-self.goal_distance) - (-self.prev_goal_distance))
-        else:
-            lyapunov_reward = 0.0
-
-        reward = progress_reward + yaw_reward + obstacle_reward + lyapunov_reward
+            reward = progress_reward + zone_reward
+            print('progress: %.3f  zone: %.3f' % (progress_reward, zone_reward))
 
         if self.succeed:
             reward = self.reward_success
@@ -413,6 +428,73 @@ class RLEnvironment(Node):
         else:
             self.cmd_vel_pub.publish(TwistStamped())
         self.destroy_timer(self.stop_cmd_vel_timer)
+
+    def parse_penalty_zones(self, entries):
+        zones = []
+        for index, entry in enumerate(entries):
+            entry = entry.strip()
+            if not entry:
+                continue
+
+            tokens = [token.strip() for token in entry.split(',')]
+            if tokens[0] == 'circle':
+                if len(tokens) != 5:
+                    raise ValueError(
+                        'penalty_zones[%d] circle format is "circle,x,y,radius,penalty"' % index
+                    )
+                center_x = float(tokens[1])
+                center_y = float(tokens[2])
+                radius = float(tokens[3])
+                penalty = float(tokens[4])
+                zones.append({
+                    'type': 'circle',
+                    'center_x': center_x,
+                    'center_y': center_y,
+                    'radius': radius,
+                    'penalty': penalty,
+                })
+                continue
+
+            if tokens[0] == 'box':
+                values = [float(token) for token in tokens[1:]]
+            else:
+                values = [float(token) for token in tokens]
+
+            if len(values) != 5:
+                raise ValueError(
+                    'penalty_zones[%d] must be "x_min,y_min,x_max,y_max,penalty" or '
+                    '"circle,x,y,radius,penalty"' % index
+                )
+
+            x_min, y_min, x_max, y_max, penalty = values
+            zones.append({
+                'type': 'box',
+                'x_min': min(x_min, x_max),
+                'x_max': max(x_min, x_max),
+                'y_min': min(y_min, y_max),
+                'y_max': max(y_min, y_max),
+                'penalty': penalty,
+            })
+
+        if zones:
+            self.get_logger().info('Loaded %d penalty zone(s)' % len(zones))
+        return zones
+
+    def calculate_penalty_zone_reward(self):
+        zone_reward = 0.0
+        for zone in self.penalty_zones:
+            if zone['type'] == 'circle':
+                dx = self.robot_pose_x - zone['center_x']
+                dy = self.robot_pose_y - zone['center_y']
+                if dx * dx + dy * dy <= zone['radius'] * zone['radius']:
+                    zone_reward += zone['penalty']
+            else:
+                inside_x = zone['x_min'] <= self.robot_pose_x <= zone['x_max']
+                inside_y = zone['y_min'] <= self.robot_pose_y <= zone['y_max']
+                if inside_x and inside_y:
+                    zone_reward += zone['penalty']
+
+        return zone_reward
 
     def euler_from_quaternion(self, quat):
         x = quat.x

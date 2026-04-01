@@ -206,7 +206,7 @@ ros2 run turtlebot3_dqn dqn_test \
 
 **`ppo_environment.py`** — Reward and state computation node.
 
-Reward at each step:
+Reward at each step for the default `legacy` strategy:
 
 ```
 r = progress_scale × (d_prev − d_curr)          # goal progress
@@ -217,7 +217,15 @@ r = progress_scale × (d_prev − d_curr)          # goal progress
 
 Terminal: `+100.0` on success, `−50.0` on collision or timeout.
 
-**`ppo_gazebo.py`** — Gazebo interface for goal spawning and robot resets. Generates random goal positions within [−2.1, 2.1] m (stages 1–3) or cycles through a fixed list (stage 4). Detects ROS 2 distro and uses the appropriate Gazebo API.
+The custom `simple_zone` strategy reduces this to:
+
+```
+r = progress_scale × (d_prev − d_curr) + zone_penalty
+```
+
+This is intended for keep-out tasks where yaw shaping and near-wall shaping can drown out the zone-avoidance signal.
+
+**`ppo_gazebo.py`** — Gazebo interface for goal spawning and robot resets. Generates random goal positions within [−2.1, 2.1] m (stages 1–3), cycles through a fixed list (stage 4), and also supports named custom scenarios such as `penalty_corridor` with a fixed goal and full episode reset on success. Detects ROS 2 distro and uses the appropriate Gazebo API.
 
 **`result_graph.py`** — PyQt5 + PyQtGraph live dashboard showing episode reward, policy loss, and value loss.
 
@@ -279,6 +287,8 @@ Terminal: `+100.0` on success, `−50.0` on collision or timeout.
 | `reward_obstacle_danger_dist` | double | 0.15 | Distance (m) at which penalty is maximum |
 | `reward_success` | double | 100.0 | Terminal reward for reaching goal |
 | `reward_fail` | double | −50.0 | Terminal reward for collision or timeout |
+| `reward_strategy` | string | `legacy` | `legacy` uses progress+yaw+obstacle shaping; `simple_zone` uses only progress plus keep-out penalties |
+| `penalty_zones` | string[] | `['']` | Keep-out regions encoded as `"x_min,y_min,x_max,y_max,penalty"` for boxes or `"circle,x,y,radius,penalty"` for circular zones |
 | `max_step` | int | 800 | Episode timeout (steps) |
 | `goal_threshold` | double | 0.20 | Goal-reached distance (m) |
 | `collision_threshold` | double | 0.15 | Collision distance (m) |
@@ -312,6 +322,12 @@ Pass the stage number as a positional argument to the Gazebo node:
 
 ```bash
 ros2 run turtlebot3_ppo ppo_gazebo 2
+```
+
+Custom named scenarios can also be launched through the workspace helper scripts. The repository now includes `penalty_corridor`, a closed room with a direct unsafe shortcut, a safer lower detour, two human obstacles, and red circular keep-out zones around them:
+
+```bash
+./start_experiment.sh experiments/scenarios/penalty_corridor.yaml 10 penalty_corridor
 ```
 
 ---
