@@ -50,6 +50,14 @@ class GazeboInterface(Node):
                 'goal_pose': (2.75, 1.15),
                 'reset_robot_on_success': True,
             },
+            'human_boxes': {
+                'goal_pose': (2.75, 1.15),
+                'reset_robot_on_success': True,
+            },
+            'safe_room': {
+                'goal_pose': (2.65, 0.95),
+                'reset_robot_on_success': True,
+            },
         }
         self.custom_scenario = self.custom_scenarios.get(self.scenario)
         if self.custom_scenario is None and self.scenario.isdigit():
