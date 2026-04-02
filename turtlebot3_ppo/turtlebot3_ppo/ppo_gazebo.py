@@ -46,16 +46,8 @@ class GazeboInterface(Node):
         super().__init__('ppo_gazebo_interface')
         self.scenario = str(stage_num)
         self.custom_scenarios = {
-            'penalty_corridor': {
-                'goal_pose': (2.75, 1.15),
-                'reset_robot_on_success': True,
-            },
-            'human_boxes': {
-                'goal_pose': (2.75, 1.15),
-                'reset_robot_on_success': True,
-            },
-            'safe_room': {
-                'goal_pose': (2.65, 0.95),
+            'warehouse_easy': {
+                'goal_pose': (2.55, 0.95),
                 'reset_robot_on_success': True,
             },
         }

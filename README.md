@@ -225,7 +225,7 @@ r = progress_scale × (d_prev − d_curr) + zone_penalty
 
 This is intended for keep-out tasks where yaw shaping and near-wall shaping can drown out the zone-avoidance signal.
 
-**`ppo_gazebo.py`** — Gazebo interface for goal spawning and robot resets. Generates random goal positions within [−2.1, 2.1] m (stages 1–3), cycles through a fixed list (stage 4), and also supports named custom scenarios such as `penalty_corridor` with a fixed goal and full episode reset on success. Detects ROS 2 distro and uses the appropriate Gazebo API.
+**`ppo_gazebo.py`** — Gazebo interface for goal spawning and robot resets. Generates random goal positions within [−2.1, 2.1] m (stages 1–3), cycles through a fixed list (stage 4), and also supports named custom scenarios such as `warehouse_easy` with a fixed goal and full episode reset on success. Detects ROS 2 distro and uses the appropriate Gazebo API.
 
 **`result_graph.py`** — PyQt5 + PyQtGraph live dashboard showing episode reward, policy loss, and value loss.
 
@@ -324,10 +324,10 @@ Pass the stage number as a positional argument to the Gazebo node:
 ros2 run turtlebot3_ppo ppo_gazebo 2
 ```
 
-Custom named scenarios can also be launched through the workspace helper scripts. The repository now includes `penalty_corridor`, a closed room with a direct unsafe shortcut, a safer lower detour, two human obstacles, and red circular keep-out zones around them:
+Custom named scenarios can also be launched through the workspace helper scripts. The repository currently includes `warehouse_easy`, a single-rack warehouse map with one unsafe upper aisle, a wider safe lower detour, and a visible pickup marker at the goal.
 
 ```bash
-./start_experiment.sh experiments/scenarios/penalty_corridor.yaml 10 penalty_corridor
+./start_experiment.sh experiments/scenarios/warehouse_easy.yaml 10 warehouse_easy
 ```
 
 ---
