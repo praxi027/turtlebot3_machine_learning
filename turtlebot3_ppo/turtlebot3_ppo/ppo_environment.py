@@ -96,9 +96,9 @@ class RLEnvironment(Node):
         self.angular_vel_max = self.get_parameter('angular_vel_max').get_parameter_value().double_value
         self.lyapunov_scale = self.get_parameter('lyapunov_scale').get_parameter_value().double_value
         self.penalty_zones = self.parse_penalty_zones(penalty_zone_entries)
-        if self.reward_strategy not in ('legacy', 'simple_zone'):
+        if self.reward_strategy not in ('legacy', 'simple_zone', 'navigation_zone'):
             raise ValueError(
-                "reward_strategy must be either 'legacy' or 'simple_zone'"
+                "reward_strategy must be 'legacy', 'simple_zone', or 'navigation_zone'"
             )
 
         self.goal_pose_x = 0.0
@@ -368,6 +368,23 @@ class RLEnvironment(Node):
             print(
                 'progress: %.3f  yaw: %.3f  obstacle: %.3f  zone: %.3f' % (
                     progress_reward, yaw_reward, obstacle_reward, zone_reward
+                )
+            )
+        elif self.reward_strategy == 'navigation_zone':
+            # Obstacle avoidance shaping without yaw alignment — avoids
+            # misleading directional signal that points through obstacles.
+            d = self.min_obstacle_distance
+            if d < self.reward_obstacle_safe_dist:
+                ratio = (self.reward_obstacle_safe_dist - d) / (
+                    self.reward_obstacle_safe_dist - self.reward_obstacle_danger_dist)
+                obstacle_reward = self.reward_obstacle_scale * ratio ** 2
+            else:
+                obstacle_reward = 0.0
+
+            reward = progress_reward + obstacle_reward + zone_reward
+            print(
+                'progress: %.3f  obstacle: %.3f  zone: %.3f' % (
+                    progress_reward, obstacle_reward, zone_reward
                 )
             )
         else:
