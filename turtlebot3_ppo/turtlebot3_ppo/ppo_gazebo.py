@@ -50,6 +50,14 @@ class GazeboInterface(Node):
                 'goal_pose': (2.55, 0.95),
                 'reset_robot_on_success': True,
             },
+            'zone_detour': {
+                'goal_pose': (3.0, 0.0),
+                'reset_robot_on_success': True,
+            },
+            'zone_approach': {
+                'goal_pose': (2.0, 1.0),
+                'reset_robot_on_success': True,
+            },
         }
         self.custom_scenario = self.custom_scenarios.get(self.scenario)
         if self.custom_scenario is None and self.scenario.isdigit():
