@@ -69,7 +69,6 @@ class RLEnvironment(Node):
         self.declare_parameter('reward_obstacle_danger_dist', 0.15)
         self.declare_parameter('reward_success', 100.0)
         self.declare_parameter('reward_fail', -50.0)
-        self.declare_parameter('reward_strategy', 'legacy')
         self.declare_parameter('penalty_zones', [''])
 
         # Environment parameters
@@ -86,7 +85,6 @@ class RLEnvironment(Node):
         self.reward_obstacle_danger_dist = self.get_parameter('reward_obstacle_danger_dist').get_parameter_value().double_value
         self.reward_success = self.get_parameter('reward_success').get_parameter_value().double_value
         self.reward_fail = self.get_parameter('reward_fail').get_parameter_value().double_value
-        self.reward_strategy = self.get_parameter('reward_strategy').get_parameter_value().string_value
         penalty_zone_entries = self.get_parameter(
             'penalty_zones'
         ).get_parameter_value().string_array_value
@@ -96,10 +94,6 @@ class RLEnvironment(Node):
         self.angular_vel_max = self.get_parameter('angular_vel_max').get_parameter_value().double_value
         self.lyapunov_scale = self.get_parameter('lyapunov_scale').get_parameter_value().double_value
         self.penalty_zones = self.parse_penalty_zones(penalty_zone_entries)
-        if self.reward_strategy not in ('legacy', 'simple_zone', 'navigation_zone'):
-            raise ValueError(
-                "reward_strategy must be 'legacy', 'simple_zone', or 'navigation_zone'"
-            )
 
         self.goal_pose_x = 0.0
         self.goal_pose_y = 0.0
@@ -337,59 +331,33 @@ class RLEnvironment(Node):
         return state
 
     def calculate_reward(self):
-        # Progress toward goal — primary learning signal
         distance_delta = self.prev_goal_distance - self.goal_distance
         progress_reward = self.reward_progress_scale * distance_delta
+
+        yaw_reward = self.reward_yaw_scale * (1.0 - 2.0 * abs(self.goal_angle) / math.pi)
+
+        d = self.min_obstacle_distance
+        if d < self.reward_obstacle_safe_dist:
+            ratio = (self.reward_obstacle_safe_dist - d) / (
+                self.reward_obstacle_safe_dist - self.reward_obstacle_danger_dist)
+            obstacle_reward = self.reward_obstacle_scale * ratio ** 2
+        else:
+            obstacle_reward = 0.0
+
+        if self.lyapunov_scale > 0.0:
+            lyapunov_reward = self.lyapunov_scale * (
+                0.99 * (-self.goal_distance) - (-self.prev_goal_distance))
+        else:
+            lyapunov_reward = 0.0
+
         zone_reward = self.calculate_penalty_zone_reward()
 
-        if self.reward_strategy == 'legacy':
-            # Heading alignment and near-obstacle shaping are kept for the
-            # original benchmark stages.
-            yaw_reward = self.reward_yaw_scale * (1.0 - 2.0 * abs(self.goal_angle) / math.pi)
-
-            d = self.min_obstacle_distance
-            if d < self.reward_obstacle_safe_dist:
-                ratio = (self.reward_obstacle_safe_dist - d) / (
-                    self.reward_obstacle_safe_dist - self.reward_obstacle_danger_dist)
-                obstacle_reward = self.reward_obstacle_scale * ratio ** 2
-            else:
-                obstacle_reward = 0.0
-
-            # Lyapunov potential-based reward shaping: γ·Φ(s') - Φ(s)
-            # where Φ(s) = -goal_distance. Theoretically preserves optimal policy
-            # (PBRS theorem) while accelerating learning.
-            if self.lyapunov_scale > 0.0:
-                lyapunov_reward = self.lyapunov_scale * (
-                    0.99 * (-self.goal_distance) - (-self.prev_goal_distance))
-            else:
-                lyapunov_reward = 0.0
-
-            reward = progress_reward + yaw_reward + obstacle_reward + lyapunov_reward + zone_reward
-            print(
-                'progress: %.3f  yaw: %.3f  obstacle: %.3f  zone: %.3f' % (
-                    progress_reward, yaw_reward, obstacle_reward, zone_reward
-                )
+        reward = progress_reward + yaw_reward + obstacle_reward + lyapunov_reward + zone_reward
+        print(
+            'progress: %.3f  yaw: %.3f  obstacle: %.3f  lyapunov: %.3f  zone: %.3f' % (
+                progress_reward, yaw_reward, obstacle_reward, lyapunov_reward, zone_reward
             )
-        elif self.reward_strategy == 'navigation_zone':
-            # Obstacle avoidance shaping without yaw alignment — avoids
-            # misleading directional signal that points through obstacles.
-            d = self.min_obstacle_distance
-            if d < self.reward_obstacle_safe_dist:
-                ratio = (self.reward_obstacle_safe_dist - d) / (
-                    self.reward_obstacle_safe_dist - self.reward_obstacle_danger_dist)
-                obstacle_reward = self.reward_obstacle_scale * ratio ** 2
-            else:
-                obstacle_reward = 0.0
-
-            reward = progress_reward + obstacle_reward + zone_reward
-            print(
-                'progress: %.3f  obstacle: %.3f  zone: %.3f' % (
-                    progress_reward, obstacle_reward, zone_reward
-                )
-            )
-        else:
-            reward = progress_reward + zone_reward
-            print('progress: %.3f  zone: %.3f' % (progress_reward, zone_reward))
+        )
 
         if self.succeed:
             reward = self.reward_success
