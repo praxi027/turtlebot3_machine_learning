@@ -430,7 +430,9 @@ class PPOAgent(Node):
 
                 self.optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                nn.utils.clip_grad_norm_(
+                    list(self.actor.parameters()) + list(self.critic.parameters()),
+                    self.max_grad_norm)
                 self.optimizer.step()
 
                 total_policy_loss += policy_loss.item()
