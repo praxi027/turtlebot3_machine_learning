@@ -316,13 +316,17 @@ class PPOAgent(Node):
             next_state = numpy.reshape(numpy.asarray(result.state), [1, self.state_size])
             reward = float(result.reward)
             done = bool(result.done)
+            zone_steps = int(result.zone_steps)
+            zone_entered = bool(result.zone_entered)
         else:
             self.get_logger().error('rl_agent_interface call failed')
             next_state = numpy.zeros([1, self.state_size])
             reward = 0.0
             done = False
+            zone_steps = 0
+            zone_entered = False
 
-        return next_state, reward, done
+        return next_state, reward, done, zone_steps, zone_entered
 
     # ------------------------------------------------------------------
     # PPO core: GAE + update
@@ -451,6 +455,7 @@ class PPOAgent(Node):
         # Rolling trackers for episode-level metrics
         recent_rewards = deque(maxlen=100)
         recent_outcomes = deque(maxlen=100)  # 'success', 'collision', 'timeout'
+        recent_zone_entries = deque(maxlen=100)
 
         state = self.reset_environment()
         time.sleep(1.0)
@@ -478,7 +483,7 @@ class PPOAgent(Node):
                     action_np = (1.0 - alpha) * action_np + alpha * prev_action
                 prev_action = action_np.copy()
 
-                next_state, reward, done = self.step(action_np)
+                next_state, reward, done, zone_steps, zone_entered = self.step(action_np)
 
                 # Publish live action info
                 msg = Float32MultiArray()
@@ -512,12 +517,14 @@ class PPOAgent(Node):
 
                     recent_rewards.append(ep_reward)
                     recent_outcomes.append(outcome)
+                    recent_zone_entries.append(zone_entered)
 
                     print(
                         'Episode:', episode,
                         '| reward:', round(ep_reward, 2),
                         '| steps:', ep_steps,
-                        '| outcome:', outcome
+                        '| outcome:', outcome,
+                        '| zone_steps:', zone_steps
                     )
 
                     if self.logging:
@@ -540,6 +547,13 @@ class PPOAgent(Node):
                         self.writer.add_scalar(
                             'ppo/episode_reward_mean100',
                             sum(recent_rewards) / len(recent_rewards),
+                            episode)
+                        self.writer.add_scalar('ppo/zone_steps', zone_steps, episode)
+                        self.writer.add_scalar('ppo/zone_entered', float(zone_entered), episode)
+                        nz = len(recent_zone_entries)
+                        self.writer.add_scalar(
+                            'ppo/zone_entry_rate',
+                            sum(1 for z in recent_zone_entries if z) / nz,
                             episode)
 
                     ep_reward = 0.0
