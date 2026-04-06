@@ -17,7 +17,7 @@
 #
 # PPO (Proximal Policy Optimization) agent for TurtleBot3 navigation.
 # Continuous 2D action space: [linear_vel, angular_vel].
-# Actor-Critic network with shared backbone, Gaussian policy, GAE.
+# Separate actor/critic networks, Gaussian policy, GAE, LR linear decay.
 
 import datetime
 import os
@@ -41,81 +41,89 @@ from turtlebot3_msgs.srv import Ppo
 current_time = datetime.datetime.now().strftime('[%mm%dd-%H:%M]')
 
 
-class ActorCritic(nn.Module):
+class Actor(nn.Module):
     """
-    Shared-backbone Actor-Critic network.
+    Policy network (separate from critic).
 
-    Backbone: 50 -> 512 -> 256 -> 128 (mirrors DQN architecture)
-    Actor head: 128 -> 2 (mean for linear_vel, angular_vel)
-    Critic head: 128 -> 1 (state value V(s))
+    Net: state -> 64 -> tanh -> 64 -> tanh -> action_mean
+    Outputs mean of Gaussian; log_std is a clamped learnable parameter.
 
-    Actions are sampled from a Gaussian distribution and squashed via tanh:
+    Actions are squashed via tanh:
       linear_vel  = 0.11 + 0.11 * tanh(raw[0])  -> [0.0, 0.22] m/s
-      angular_vel = 1.5  * tanh(raw[1])          -> [-1.5, 1.5] rad/s
+      angular_vel = angular_vel_max * tanh(raw[1])
     """
 
-    def __init__(self, state_size=50, action_size=2, angular_vel_max=2.84):
+    def __init__(self, state_size, action_size, angular_vel_max=2.84):
         super().__init__()
         self.angular_vel_max = angular_vel_max
 
-        self.backbone = nn.Sequential(
-            nn.Linear(state_size, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, 128),
-            nn.ReLU(),
+        self.net = nn.Sequential(
+            nn.Linear(state_size, 64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
         )
-        self.actor_mean = nn.Linear(128, action_size)
-        # Learnable log_std shared across all states (common PPO practice)
+        self.mean = nn.Linear(64, action_size)
         self.log_std = nn.Parameter(torch.zeros(action_size))
-        self.critic = nn.Linear(128, 1)
 
-        # Orthogonal init for stability
-        for layer in self.backbone:
+        for layer in self.net:
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, gain=numpy.sqrt(2))
                 nn.init.zeros_(layer.bias)
-        nn.init.orthogonal_(self.actor_mean.weight, gain=0.01)
-        nn.init.zeros_(self.actor_mean.bias)
-        nn.init.orthogonal_(self.critic.weight, gain=1.0)
-        nn.init.zeros_(self.critic.bias)
+        nn.init.orthogonal_(self.mean.weight, gain=0.01)
+        nn.init.zeros_(self.mean.bias)
+
+    def _clamped_std(self):
+        return torch.clamp(self.log_std, -2.0, 0.5).exp()
 
     def forward(self, state):
-        x = self.backbone(state)
-        mean = self.actor_mean(x)
-        value = self.critic(x).squeeze(-1)
-        return mean, value
+        return self.mean(self.net(state))
 
-    def get_action_and_value(self, state):
-        """Sample action from policy, return (action, action_raw, log_prob, value)."""
-        mean, value = self.forward(state)
-        std = self.log_std.exp().expand_as(mean)
+    def get_action(self, state):
+        mean = self.forward(state)
+        std = self._clamped_std().expand_as(mean)
         dist = Normal(mean, std)
         action_raw = dist.sample()
         log_prob = dist.log_prob(action_raw).sum(dim=-1)
-
         action = self._squash(action_raw)
-        return action, action_raw, log_prob, value
+        return action, action_raw, log_prob
 
     def evaluate(self, state, action_raw):
-        """Recompute log_prob and entropy for given (state, action_raw) pairs."""
-        mean, value = self.forward(state)
-        std = self.log_std.exp().expand_as(mean)
+        mean = self.forward(state)
+        std = self._clamped_std().expand_as(mean)
         dist = Normal(mean, std)
         log_prob = dist.log_prob(action_raw).sum(dim=-1)
         entropy = dist.entropy().sum(dim=-1)
-        return log_prob, entropy, value
-
-    def get_value(self, state):
-        _, value = self.forward(state)
-        return value
+        return log_prob, entropy
 
     def _squash(self, action_raw):
-        """Map unbounded raw actions to [linear_min, linear_max] x [-angular_max, angular_max]."""
         linear = 0.11 + 0.11 * torch.tanh(action_raw[..., 0:1])   # [0.0, 0.22]
         angular = self.angular_vel_max * torch.tanh(action_raw[..., 1:2])
         return torch.cat([linear, angular], dim=-1)
+
+
+class Critic(nn.Module):
+    """Value network (separate from actor). Net: state -> 64 -> tanh -> 64 -> tanh -> V(s)."""
+
+    def __init__(self, state_size):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(state_size, 64),
+            nn.Tanh(),
+            nn.Linear(64, 64),
+            nn.Tanh(),
+        )
+        self.value = nn.Linear(64, 1)
+
+        for layer in self.net:
+            if isinstance(layer, nn.Linear):
+                nn.init.orthogonal_(layer.weight, gain=numpy.sqrt(2))
+                nn.init.zeros_(layer.bias)
+        nn.init.orthogonal_(self.value.weight, gain=1.0)
+        nn.init.zeros_(self.value.bias)
+
+    def forward(self, state):
+        return self.value(self.net(state)).squeeze(-1)
 
 
 class RolloutBuffer:
@@ -212,15 +220,20 @@ class PPOAgent(Node):
         )
         self.get_logger().info(f'Using device: {self.device}')
 
-        # Dimensions
-        self.state_size = 50
+        # Dimensions: [goal_dist, goal_angle, linear_vel, angular_vel, 48 lidar rays]
+        self.state_size = 52
         self.action_size = 2  # [linear_vel, angular_vel]
 
-        # Network and optimiser
-        self.model = ActorCritic(
+        # Separate actor and critic networks
+        self.initial_lr = self.learning_rate
+        self.actor = Actor(
             self.state_size, self.action_size, angular_vel_max=self.angular_vel_max
         ).to(self.device)
-        self.optimizer = optim.Adam(self.model.parameters(), lr=self.learning_rate, eps=1e-5)
+        self.critic = Critic(self.state_size).to(self.device)
+        self.optimizer = optim.Adam(
+            list(self.actor.parameters()) + list(self.critic.parameters()),
+            lr=self.learning_rate, eps=1e-5
+        )
 
         run_experiment = experiment_name if experiment_name else 'default'
         if checkpoint_dir or tensorboard_dir:
@@ -246,8 +259,12 @@ class PPOAgent(Node):
         self.load_episode = 0
         if model_file:
             model_path = os.path.join(self.model_dir_path, model_file)
-            checkpoint = torch.load(model_path, map_location=self.device)
-            self.model.load_state_dict(checkpoint['model_state'])
+            checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+            if 'actor_state' in checkpoint:
+                self.actor.load_state_dict(checkpoint['actor_state'])
+                self.critic.load_state_dict(checkpoint['critic_state'])
+            else:
+                self.get_logger().warn('Legacy checkpoint format — skipping load')
             self.load_episode = checkpoint.get('trained_episodes', 0)
             self.get_logger().info(f'Loaded model from {model_path} (episode {self.load_episode})')
 
@@ -391,9 +408,10 @@ class PPOAgent(Node):
                 mb_advantages = advantages_t[mb_idx]
                 mb_returns = returns_t[mb_idx]
 
-                new_log_probs, entropy, new_values = self.model.evaluate(
+                new_log_probs, entropy = self.actor.evaluate(
                     mb_states, mb_actions_raw
                 )
+                new_values = self.critic(mb_states)
 
                 # PPO clipped surrogate objective
                 ratio = torch.exp(new_log_probs - mb_old_log_probs)
@@ -459,25 +477,28 @@ class PPOAgent(Node):
 
         state = self.reset_environment()
         time.sleep(1.0)
-        prev_action = None  # for action smoothing EMA
+        prev_action = None
 
         while episode < self.max_training_episodes:
             # === ROLLOUT COLLECTION ===
             self.buffer.clear()
 
             for _ in range(self.rollout_steps):
-                self.model.eval()
+                self.actor.eval()
+                self.critic.eval()
                 with torch.no_grad():
                     state_t = torch.FloatTensor(state).to(self.device)
-                    action, action_raw, log_prob, value = self.model.get_action_and_value(state_t)
-                self.model.train()
+                    action, action_raw, log_prob = self.actor.get_action(state_t)
+                    value = self.critic(state_t)
+                self.actor.train()
+                self.critic.train()
 
                 action_np = action.cpu().numpy()    # (1, 2) squashed action
                 action_raw_np = action_raw.cpu().numpy()  # (1, 2) pre-tanh
                 log_prob_np = log_prob.cpu().item()
                 value_np = value.cpu().item()
 
-                # Action smoothing: EMA blends with previous action
+                # Action smoothing (EMA, disabled by default with alpha=0.0)
                 if self.action_smoothing > 0.0 and prev_action is not None:
                     alpha = self.action_smoothing
                     action_np = (1.0 - alpha) * action_np + alpha * prev_action
@@ -510,7 +531,7 @@ class PPOAgent(Node):
                     if reward == 100.0:
                         outcome = 'success'
                     elif reward == -50.0:
-                        min_lidar = float(numpy.min(next_state[0][2:]))
+                        min_lidar = float(numpy.min(next_state[0][4:]))
                         outcome = 'collision' if min_lidar < 0.20 else 'timeout'
                     else:
                         outcome = 'timeout'
@@ -570,11 +591,11 @@ class PPOAgent(Node):
                 time.sleep(0.01)
 
             # Bootstrap last value for GAE
-            self.model.eval()
+            self.critic.eval()
             with torch.no_grad():
                 last_state_t = torch.FloatTensor(state).to(self.device)
-                last_value = self.model.get_value(last_state_t).cpu().item()
-            self.model.train()
+                last_value = self.critic(last_state_t).cpu().item()
+            self.critic.train()
 
             # === PPO UPDATE ===
             advantages, returns = self.compute_gae(last_value)
@@ -611,6 +632,12 @@ class PPOAgent(Node):
             msg.data = [float(ep_reward), float(policy_loss), float(value_loss), float(entropy)]
             self.result_pub.publish(msg)
 
+            # Linear LR decay
+            frac = 1.0 - (episode / self.max_training_episodes)
+            self.learning_rate = self.initial_lr * max(frac, 0.0)
+            for param_group in self.optimizer.param_groups:
+                param_group['lr'] = self.learning_rate
+
             if self.logging:
                 self.writer.add_scalar('ppo/policy_loss', policy_loss, rollout_num)
                 self.writer.add_scalar('ppo/value_loss', value_loss, rollout_num)
@@ -620,8 +647,10 @@ class PPOAgent(Node):
                 self.writer.add_scalar('ppo/explained_variance', explained_var, rollout_num)
                 self.writer.add_scalar('ppo/learning_rate', self.learning_rate, rollout_num)
                 with torch.no_grad():
-                    std_mean = self.model.log_std.exp().mean().item()
+                    std_mean = self.actor._clamped_std().mean().item()
+                    log_std_mean = self.actor.log_std.mean().item()
                 self.writer.add_scalar('ppo/action_std', std_mean, rollout_num)
+                self.writer.add_scalar('ppo/log_std_raw', log_std_mean, rollout_num)
 
     def _save_config(self, log_dir):
         """Write hyperparameters to config.txt inside the TensorBoard log dir."""
@@ -637,12 +666,13 @@ class PPOAgent(Node):
                          'angular_vel_max']:
                 f.write(f'{name} = {getattr(self, name)}\n')
             with torch.no_grad():
-                log_std = self.model.log_std.tolist()
+                log_std = self.actor.log_std.tolist()
             f.write(f'log_std_init = {log_std}\n')
             f.write(f'\n=== Network ===\n')
             f.write(f'state_size = {self.state_size}\n')
             f.write(f'action_size = {self.action_size}\n')
-            f.write(f'{self.model}\n')
+            f.write(f'Actor:\n{self.actor}\n')
+            f.write(f'Critic:\n{self.critic}\n')
         self.get_logger().info(f'Config saved: {config_path}')
 
     def _save_model(self, episode):
@@ -653,7 +683,8 @@ class PPOAgent(Node):
                 break
             idx += 1
         torch.save({
-            'model_state': self.model.state_dict(),
+            'actor_state': self.actor.state_dict(),
+            'critic_state': self.critic.state_dict(),
             'trained_episodes': episode,
         }, model_path)
         self.get_logger().info(f'Model saved: {model_path} (episode {episode})')

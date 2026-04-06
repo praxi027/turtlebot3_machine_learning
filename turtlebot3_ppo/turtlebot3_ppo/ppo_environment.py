@@ -107,6 +107,8 @@ class RLEnvironment(Node):
         self.goal_angle = 0.0
         self.goal_distance = 1.0
         self.init_goal_distance = 0.5
+        self.robot_linear_vel = 0.0
+        self.robot_angular_vel = 0.0
         self.scan_ranges = []
         self.front_ranges = []
         self.front_angles = []
@@ -275,6 +277,8 @@ class RLEnvironment(Node):
         self.robot_pose_x = msg.pose.pose.position.x
         self.robot_pose_y = msg.pose.pose.position.y
         _, _, self.robot_pose_theta = self.euler_from_quaternion(msg.pose.pose.orientation)
+        self.robot_linear_vel = msg.twist.twist.linear.x
+        self.robot_angular_vel = msg.twist.twist.angular.z
 
         goal_distance = math.sqrt(
             (self.goal_pose_x - self.robot_pose_x) ** 2
@@ -296,6 +300,8 @@ class RLEnvironment(Node):
         state = []
         state.append(float(self.goal_distance))
         state.append(float(self.goal_angle))
+        state.append(float(self.robot_linear_vel))
+        state.append(float(self.robot_angular_vel))
         for var in self.scan_ranges:
             state.append(float(var))
         self.local_step += 1
