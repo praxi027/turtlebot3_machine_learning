@@ -112,6 +112,9 @@ class RLEnvironment(Node):
         self.front_angles = []
         self.min_obstacle_distance = 10.0
 
+        self.zone_steps_in_episode = 0
+        self.zone_entered_in_episode = False
+
         self.local_step = 0
         self.stop_cmd_vel_timer = None
 
@@ -209,6 +212,8 @@ class RLEnvironment(Node):
         state = self.calculate_state()
         self.init_goal_distance = state[0]
         self.prev_goal_distance = self.init_goal_distance
+        self.zone_steps_in_episode = 0
+        self.zone_entered_in_episode = False
         response.state = state
 
         return response
@@ -337,9 +342,9 @@ class RLEnvironment(Node):
         yaw_reward = self.reward_yaw_scale * (1.0 - 2.0 * abs(self.goal_angle) / math.pi)
 
         d = self.min_obstacle_distance
-        if d < self.reward_obstacle_safe_dist:
-            ratio = (self.reward_obstacle_safe_dist - d) / (
-                self.reward_obstacle_safe_dist - self.reward_obstacle_danger_dist)
+        denom = self.reward_obstacle_safe_dist - self.reward_obstacle_danger_dist
+        if d < self.reward_obstacle_safe_dist and denom > 0.0:
+            ratio = (self.reward_obstacle_safe_dist - d) / denom
             obstacle_reward = self.reward_obstacle_scale * ratio ** 2
         else:
             obstacle_reward = 0.0
@@ -398,6 +403,8 @@ class RLEnvironment(Node):
         response.reward = self.calculate_reward()
         self.prev_goal_distance = self.goal_distance
         response.done = self.done
+        response.zone_steps = self.zone_steps_in_episode
+        response.zone_entered = self.zone_entered_in_episode
 
         if self.done is True:
             self.done = False
@@ -467,17 +474,24 @@ class RLEnvironment(Node):
 
     def calculate_penalty_zone_reward(self):
         zone_reward = 0.0
+        in_zone = False
         for zone in self.penalty_zones:
             if zone['type'] == 'circle':
                 dx = self.robot_pose_x - zone['center_x']
                 dy = self.robot_pose_y - zone['center_y']
                 if dx * dx + dy * dy <= zone['radius'] * zone['radius']:
                     zone_reward += zone['penalty']
+                    in_zone = True
             else:
                 inside_x = zone['x_min'] <= self.robot_pose_x <= zone['x_max']
                 inside_y = zone['y_min'] <= self.robot_pose_y <= zone['y_max']
                 if inside_x and inside_y:
                     zone_reward += zone['penalty']
+                    in_zone = True
+
+        if in_zone:
+            self.zone_steps_in_episode += 1
+            self.zone_entered_in_episode = True
 
         return zone_reward
 
