@@ -126,6 +126,48 @@ class Critic(nn.Module):
         return self.value(self.net(state)).squeeze(-1)
 
 
+class RunningMeanStd:
+    """Welford's online algorithm for tracking mean/variance (matches SB3/OpenAI baselines)."""
+
+    def __init__(self, shape):
+        self.mean = numpy.zeros(shape, dtype=numpy.float64)
+        self.var = numpy.ones(shape, dtype=numpy.float64)
+        self.count = 1e-4  # avoid div-by-zero on first use
+
+    def update(self, x):
+        """Update statistics with a batch of observations. x shape: (batch, *shape) or (*shape,)."""
+        batch = numpy.asarray(x, dtype=numpy.float64)
+        if batch.ndim == len(self.mean.shape):
+            batch = batch[numpy.newaxis]  # single sample → batch of 1
+        batch_mean = batch.mean(axis=0)
+        batch_var = batch.var(axis=0)
+        batch_count = batch.shape[0]
+        self._update_from_moments(batch_mean, batch_var, batch_count)
+
+    def _update_from_moments(self, batch_mean, batch_var, batch_count):
+        delta = batch_mean - self.mean
+        total = self.count + batch_count
+        new_mean = self.mean + delta * batch_count / total
+        m_a = self.var * self.count
+        m_b = batch_var * batch_count
+        m2 = m_a + m_b + (delta ** 2) * self.count * batch_count / total
+        self.mean = new_mean
+        self.var = m2 / total
+        self.count = total
+
+    def normalize(self, x):
+        return (x - self.mean.astype(numpy.float32)) / (
+            numpy.sqrt(self.var.astype(numpy.float32)) + 1e-8)
+
+    def state_dict(self):
+        return {'mean': self.mean.copy(), 'var': self.var.copy(), 'count': self.count}
+
+    def load_state_dict(self, d):
+        self.mean = d['mean']
+        self.var = d['var']
+        self.count = d['count']
+
+
 class RolloutBuffer:
     """On-policy rollout buffer storing N steps of experience."""
 
@@ -263,6 +305,9 @@ class PPOAgent(Node):
             if 'actor_state' in checkpoint:
                 self.actor.load_state_dict(checkpoint['actor_state'])
                 self.critic.load_state_dict(checkpoint['critic_state'])
+                if 'obs_rms' in checkpoint:
+                    self.obs_rms.load_state_dict(checkpoint['obs_rms'])
+                    self.ret_rms.load_state_dict(checkpoint['ret_rms'])
             else:
                 self.get_logger().warn('Legacy checkpoint format — skipping load')
             self.load_episode = checkpoint.get('trained_episodes', 0)
@@ -277,6 +322,11 @@ class PPOAgent(Node):
             os.makedirs(log_dir, exist_ok=True)
             self.writer = SummaryWriter(log_dir, flush_secs=30)
             self._save_config(log_dir)
+
+        # Observation and return normalization (à la SB3 VecNormalize)
+        self.obs_rms = RunningMeanStd(shape=(self.state_size,))
+        self.ret_rms = RunningMeanStd(shape=())
+        self.ret_running = 0.0  # discounted return accumulator for reward normalization
 
         # ROS clients and publishers
         self.rl_agent_interface_client = self.create_client(Ppo, 'rl_agent_interface')
@@ -486,10 +536,14 @@ class PPOAgent(Node):
             self.buffer.clear()
 
             for _ in range(self.rollout_steps):
+                # Normalize observation
+                self.obs_rms.update(state)
+                norm_state = self.obs_rms.normalize(state)
+
                 self.actor.eval()
                 self.critic.eval()
                 with torch.no_grad():
-                    state_t = torch.FloatTensor(state).to(self.device)
+                    state_t = torch.FloatTensor(norm_state).to(self.device)
                     action, action_raw, log_prob = self.actor.get_action(state_t)
                     value = self.critic(state_t)
                 self.actor.train()
@@ -508,6 +562,11 @@ class PPOAgent(Node):
 
                 next_state, reward, done, zone_steps, zone_entered = self.step(action_np)
 
+                # Normalize reward by running return std
+                self.ret_running = self.ret_running * self.gamma + reward
+                self.ret_rms.update(numpy.array([self.ret_running]))
+                norm_reward = reward / (numpy.sqrt(self.ret_rms.var) + 1e-8)
+
                 # Publish live action info
                 msg = Float32MultiArray()
                 msg.data = [float(action_np[0, 0]), float(action_np[0, 1]),
@@ -515,8 +574,8 @@ class PPOAgent(Node):
                 self.action_pub.publish(msg)
 
                 self.buffer.add(
-                    state, action_np, action_raw_np,
-                    log_prob_np, reward, done, value_np
+                    norm_state, action_np, action_raw_np,
+                    log_prob_np, norm_reward, done, value_np
                 )
 
                 ep_reward += reward
@@ -582,6 +641,7 @@ class PPOAgent(Node):
                     ep_reward = 0.0
                     ep_steps = 0
                     prev_action = None
+                    self.ret_running = 0.0  # reset return accumulator
                     state = self.reset_environment()
 
                     if episode % self.save_interval == 0:
@@ -592,10 +652,11 @@ class PPOAgent(Node):
 
                 time.sleep(0.01)
 
-            # Bootstrap last value for GAE
+            # Bootstrap last value for GAE (use normalized state)
+            norm_state = self.obs_rms.normalize(state)
             self.critic.eval()
             with torch.no_grad():
-                last_state_t = torch.FloatTensor(state).to(self.device)
+                last_state_t = torch.FloatTensor(norm_state).to(self.device)
                 last_value = self.critic(last_state_t).cpu().item()
             self.critic.train()
 
@@ -687,6 +748,8 @@ class PPOAgent(Node):
         torch.save({
             'actor_state': self.actor.state_dict(),
             'critic_state': self.critic.state_dict(),
+            'obs_rms': self.obs_rms.state_dict(),
+            'ret_rms': self.ret_rms.state_dict(),
             'trained_episodes': episode,
         }, model_path)
         self.get_logger().info(f'Model saved: {model_path} (episode {episode})')
