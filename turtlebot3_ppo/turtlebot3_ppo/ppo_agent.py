@@ -71,6 +71,10 @@ class Actor(nn.Module):
         action = self._squash(action_raw)
         return action, action_raw, log_prob
 
+    def get_deterministic_action(self, state):
+        mean = self.forward(state)
+        return self._squash(mean)
+
     def evaluate(self, state, action_raw):
         mean = self.forward(state)
         std = self._clamped_std().expand_as(mean)
@@ -211,6 +215,10 @@ class PPOAgent(Node):
         self.declare_parameter('entropy_coeff', 0.01)
         self.declare_parameter('max_grad_norm', 0.5)
         self.declare_parameter('save_interval', 100)
+        self.declare_parameter('eval_interval', 100)
+        self.declare_parameter('eval_episodes', 5)
+        self.declare_parameter('eval_deterministic', True)
+        self.declare_parameter('save_best_eval', True)
         self.declare_parameter('angular_vel_max', 2.84)
         self.declare_parameter('action_smoothing', 0.0)
 
@@ -237,6 +245,18 @@ class PPOAgent(Node):
         self.entropy_coeff = self.get_parameter('entropy_coeff').get_parameter_value().double_value
         self.max_grad_norm = self.get_parameter('max_grad_norm').get_parameter_value().double_value
         self.save_interval = self.get_parameter('save_interval').get_parameter_value().integer_value
+        self.eval_interval = max(
+            0, self.get_parameter('eval_interval').get_parameter_value().integer_value
+        )
+        self.eval_episodes = max(
+            1, self.get_parameter('eval_episodes').get_parameter_value().integer_value
+        )
+        self.eval_deterministic = self.get_parameter(
+            'eval_deterministic'
+        ).get_parameter_value().bool_value
+        self.save_best_eval = self.get_parameter(
+            'save_best_eval'
+        ).get_parameter_value().bool_value
         self.angular_vel_max = self.get_parameter('angular_vel_max').get_parameter_value().double_value
         self.action_smoothing = self.get_parameter('action_smoothing').get_parameter_value().double_value
 
@@ -276,6 +296,11 @@ class PPOAgent(Node):
             self.model_dir_path = os.path.join(self.run_dir, 'checkpoints')
         os.makedirs(self.model_dir_path, exist_ok=True)
 
+        # Observation and return normalization (a la SB3 VecNormalize)
+        self.obs_rms = RunningMeanStd(shape=(self.state_size,))
+        self.ret_rms = RunningMeanStd(shape=())
+        self.ret_running = 0.0  # discounted return accumulator for reward normalization
+
         self.load_episode = 0
         if model_file:
             model_path = os.path.join(self.model_dir_path, model_file)
@@ -284,6 +309,7 @@ class PPOAgent(Node):
             self.critic.load_state_dict(checkpoint['critic_state'])
             if 'obs_rms' in checkpoint:
                 self.obs_rms.load_state_dict(checkpoint['obs_rms'])
+            if 'ret_rms' in checkpoint:
                 self.ret_rms.load_state_dict(checkpoint['ret_rms'])
             self.load_episode = checkpoint.get('trained_episodes', 0)
             self.get_logger().info(f'Loaded model from {model_path} (episode {self.load_episode})')
@@ -298,10 +324,9 @@ class PPOAgent(Node):
             self.writer = SummaryWriter(log_dir, flush_secs=30)
             self._save_config(log_dir)
 
-        # Observation and return normalization (à la SB3 VecNormalize)
-        self.obs_rms = RunningMeanStd(shape=(self.state_size,))
-        self.ret_rms = RunningMeanStd(shape=())
-        self.ret_running = 0.0  # discounted return accumulator for reward normalization
+        self.best_eval_score = None
+        self.best_eval_metrics = None
+        self.last_eval_episode = None
 
         # ROS clients and publishers
         self.rl_agent_interface_client = self.create_client(Ppo, 'rl_agent_interface')
@@ -369,6 +394,145 @@ class PPOAgent(Node):
             zone_entered = False
 
         return next_state, reward, done, zone_steps, zone_entered
+
+    def classify_outcome(self, reward, next_state):
+        goal_dist = float(next_state[0][0])
+        if reward == 100.0:
+            outcome = 'success'
+        elif reward == -50.0:
+            min_lidar = float(numpy.min(next_state[0][4:]))
+            outcome = 'collision' if min_lidar < 0.20 else 'timeout'
+        else:
+            outcome = 'timeout'
+        return outcome, goal_dist
+
+    def run_evaluation_episode(self):
+        state = self.reset_environment()
+        prev_action = None
+        ep_reward = 0.0
+        ep_steps = 0
+
+        while True:
+            norm_state = self.obs_rms.normalize(state)
+            with torch.no_grad():
+                state_t = torch.FloatTensor(norm_state).to(self.device)
+                if self.eval_deterministic:
+                    action = self.actor.get_deterministic_action(state_t)
+                else:
+                    action, _, _ = self.actor.get_action(state_t)
+
+            action_np = action.cpu().numpy()
+            if self.action_smoothing > 0.0 and prev_action is not None:
+                alpha = self.action_smoothing
+                action_np = (1.0 - alpha) * action_np + alpha * prev_action
+            prev_action = action_np.copy()
+
+            next_state, reward, done, zone_steps, zone_entered = self.step(action_np)
+            ep_reward += reward
+            ep_steps += 1
+            state = next_state
+
+            if done:
+                outcome, goal_dist = self.classify_outcome(reward, next_state)
+                return {
+                    'reward': ep_reward,
+                    'length': ep_steps,
+                    'goal_distance_at_end': goal_dist,
+                    'zone_steps': zone_steps,
+                    'zone_entered': float(zone_entered),
+                    'success': 1.0 if outcome == 'success' else 0.0,
+                    'collision': 1.0 if outcome == 'collision' else 0.0,
+                    'timeout': 1.0 if outcome == 'timeout' else 0.0,
+                }
+
+            time.sleep(0.01)
+
+    def evaluate_policy(self, episode):
+        self.get_logger().info(
+            f'Starting evaluation at training episode {episode} '
+            f'({self.eval_episodes} episode(s), deterministic={self.eval_deterministic})'
+        )
+
+        actor_was_training = self.actor.training
+        critic_was_training = self.critic.training
+        self.actor.eval()
+        self.critic.eval()
+
+        episode_metrics = [self.run_evaluation_episode() for _ in range(self.eval_episodes)]
+
+        if actor_was_training:
+            self.actor.train()
+        if critic_was_training:
+            self.critic.train()
+
+        summary = {
+            'success_rate': sum(m['success'] for m in episode_metrics) / len(episode_metrics),
+            'collision_rate': sum(m['collision'] for m in episode_metrics) / len(episode_metrics),
+            'timeout_rate': sum(m['timeout'] for m in episode_metrics) / len(episode_metrics),
+            'episode_reward_mean': sum(m['reward'] for m in episode_metrics) / len(episode_metrics),
+            'episode_length_mean': sum(m['length'] for m in episode_metrics) / len(episode_metrics),
+            'goal_distance_at_end_mean': (
+                sum(m['goal_distance_at_end'] for m in episode_metrics) / len(episode_metrics)
+            ),
+            'zone_steps_mean': sum(m['zone_steps'] for m in episode_metrics) / len(episode_metrics),
+            'zone_entry_rate': (
+                sum(m['zone_entered'] for m in episode_metrics) / len(episode_metrics)
+            ),
+        }
+
+        if self.logging:
+            self.writer.add_scalar('ppo_eval/success_rate', summary['success_rate'], episode)
+            self.writer.add_scalar('ppo_eval/collision_rate', summary['collision_rate'], episode)
+            self.writer.add_scalar('ppo_eval/timeout_rate', summary['timeout_rate'], episode)
+            self.writer.add_scalar(
+                'ppo_eval/episode_reward_mean', summary['episode_reward_mean'], episode
+            )
+            self.writer.add_scalar(
+                'ppo_eval/episode_length_mean', summary['episode_length_mean'], episode
+            )
+            self.writer.add_scalar(
+                'ppo_eval/goal_distance_at_end_mean',
+                summary['goal_distance_at_end_mean'],
+                episode
+            )
+            self.writer.add_scalar('ppo_eval/zone_steps_mean', summary['zone_steps_mean'], episode)
+            self.writer.add_scalar('ppo_eval/zone_entry_rate', summary['zone_entry_rate'], episode)
+
+        score = (
+            summary['success_rate'],
+            -summary['zone_entry_rate'],
+            -summary['collision_rate'],
+            -summary['timeout_rate'],
+            summary['episode_reward_mean'],
+        )
+        is_best = self.best_eval_score is None or score > self.best_eval_score
+        if is_best:
+            self.best_eval_score = score
+            self.best_eval_metrics = dict(summary)
+            if self.save_best_eval:
+                self._save_named_model(
+                    'best_eval.pt',
+                    episode,
+                    extra_state={'best_eval_metrics': summary}
+                )
+
+        self.last_eval_episode = episode
+        self.get_logger().info(
+            'Evaluation | episode: %d | success: %.1f%% | collision: %.1f%% | '
+            'timeout: %.1f%% | zone_entry: %.1f%% | mean_reward: %.2f%s' % (
+                episode,
+                100.0 * summary['success_rate'],
+                100.0 * summary['collision_rate'],
+                100.0 * summary['timeout_rate'],
+                100.0 * summary['zone_entry_rate'],
+                summary['episode_reward_mean'],
+                ' | new best' if is_best else ''
+            )
+        )
+
+        state = self.reset_environment()
+        time.sleep(1.0)
+        return state
 
     # ------------------------------------------------------------------
     # PPO core: GAE + update
@@ -561,16 +725,7 @@ class PPOAgent(Node):
                 if done:
                     episode += 1
 
-                    # Classify outcome using reward (the environment already
-                    # determined success/failure; state may reflect the next goal).
-                    goal_dist = float(next_state[0][0])
-                    if reward == 100.0:
-                        outcome = 'success'
-                    elif reward == -50.0:
-                        min_lidar = float(numpy.min(next_state[0][4:]))
-                        outcome = 'collision' if min_lidar < 0.20 else 'timeout'
-                    else:
-                        outcome = 'timeout'
+                    outcome, goal_dist = self.classify_outcome(reward, next_state)
 
                     recent_rewards.append(ep_reward)
                     recent_outcomes.append(outcome)
@@ -621,6 +776,9 @@ class PPOAgent(Node):
 
                     if episode % self.save_interval == 0:
                         self._save_model(episode)
+
+                    if self.eval_interval > 0 and episode % self.eval_interval == 0:
+                        state = self.evaluate_policy(episode)
 
                     if episode >= self.max_training_episodes:
                         break
@@ -690,6 +848,13 @@ class PPOAgent(Node):
                 self.writer.add_scalar('ppo/action_std', std_mean, rollout_num)
                 self.writer.add_scalar('ppo/log_std_raw', log_std_mean, rollout_num)
 
+        if (
+            self.eval_interval > 0
+            and episode > 0
+            and self.last_eval_episode != episode
+        ):
+            self.evaluate_policy(episode)
+
     def _save_config(self, log_dir):
         """Write hyperparameters to config.txt inside the TensorBoard log dir."""
         config_path = os.path.join(log_dir, 'config.txt')
@@ -701,6 +866,8 @@ class PPOAgent(Node):
             for name in ['gamma', 'gae_lambda', 'clip_epsilon', 'learning_rate',
                          'rollout_steps', 'n_epochs', 'minibatch_size',
                          'value_coeff', 'entropy_coeff', 'max_grad_norm',
+                         'eval_interval', 'eval_episodes', 'eval_deterministic',
+                         'save_best_eval',
                          'angular_vel_max']:
                 f.write(f'{name} = {getattr(self, name)}\n')
             with torch.no_grad():
@@ -727,6 +894,20 @@ class PPOAgent(Node):
             'ret_rms': self.ret_rms.state_dict(),
             'trained_episodes': episode,
         }, model_path)
+        self.get_logger().info(f'Model saved: {model_path} (episode {episode})')
+
+    def _save_named_model(self, filename, episode, extra_state=None):
+        model_path = os.path.join(self.model_dir_path, filename)
+        state = {
+            'actor_state': self.actor.state_dict(),
+            'critic_state': self.critic.state_dict(),
+            'obs_rms': self.obs_rms.state_dict(),
+            'ret_rms': self.ret_rms.state_dict(),
+            'trained_episodes': episode,
+        }
+        if extra_state:
+            state.update(extra_state)
+        torch.save(state, model_path)
         self.get_logger().info(f'Model saved: {model_path} (episode {episode})')
 
 
