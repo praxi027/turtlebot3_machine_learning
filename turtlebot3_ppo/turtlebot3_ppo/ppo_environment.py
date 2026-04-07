@@ -1,27 +1,9 @@
 #!/usr/bin/env python3
-#################################################################################
-# Copyright 2019 ROBOTIS CO., LTD.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#################################################################################
-#
-# Adapted from dqn_environment.py for PPO with continuous actions.
-# Key changes:
-#   - Uses Ppo.srv instead of Dqn.srv
-#   - Action is a float32[2] array: [linear_vel, angular_vel]
-#   - Agent has full control over linear velocity (no adaptive safety scalar)
-#   - Goal services renamed to ppo_task_succeed / ppo_task_failed / ppo_initialize_env
-#   - Result topic is /ppo_result, action topic is /ppo_action
+# PPO environment node for TurtleBot3 navigation.
+# Receives continuous actions [linear_vel, angular_vel], computes reward,
+# returns next state (goal_dist, goal_angle, linear_vel, angular_vel, 48 lidar).
+# Supports configurable penalty zones for zone-avoidance training.
 
 import math
 import os
@@ -110,8 +92,6 @@ class RLEnvironment(Node):
         self.robot_linear_vel = 0.0
         self.robot_angular_vel = 0.0
         self.scan_ranges = []
-        self.front_ranges = []
-        self.front_angles = []
         self.min_obstacle_distance = 10.0
 
         self.zone_steps_in_episode = 0
@@ -249,28 +229,12 @@ class RLEnvironment(Node):
 
     def scan_sub_callback(self, scan):
         self.scan_ranges = []
-        self.front_ranges = []
-        self.front_angles = []
-
-        num_of_lidar_rays = len(scan.ranges)
-        angle_min = scan.angle_min
-        angle_increment = scan.angle_increment
-
-        for i in range(num_of_lidar_rays):
-            angle = angle_min + i * angle_increment
-            distance = scan.ranges[i]
-
+        for distance in scan.ranges:
             if distance == float('Inf'):
                 distance = 3.5
             elif numpy.isnan(distance):
                 distance = 0.0
-
             self.scan_ranges.append(distance)
-
-            if (0 <= angle <= math.pi / 2) or (3 * math.pi / 2 <= angle <= 2 * math.pi):
-                self.front_ranges.append(distance)
-                self.front_angles.append(angle)
-
         self.min_obstacle_distance = min(self.scan_ranges) if self.scan_ranges else 10.0
 
     def odom_sub_callback(self, msg):
@@ -296,24 +260,26 @@ class RLEnvironment(Node):
         self.goal_distance = goal_distance
         self.goal_angle = goal_angle
 
+    def _stop_robot(self):
+        if ROS_DISTRO == 'humble':
+            self.cmd_vel_pub.publish(Twist())
+        else:
+            self.cmd_vel_pub.publish(TwistStamped())
+
     def calculate_state(self):
-        state = []
-        state.append(float(self.goal_distance))
-        state.append(float(self.goal_angle))
-        state.append(float(self.robot_linear_vel))
-        state.append(float(self.robot_angular_vel))
-        for var in self.scan_ranges:
-            state.append(float(var))
+        state = [
+            float(self.goal_distance),
+            float(self.goal_angle),
+            float(self.robot_linear_vel),
+            float(self.robot_angular_vel),
+        ] + [float(r) for r in self.scan_ranges]
         self.local_step += 1
 
         if self.goal_distance < self.goal_threshold:
             self.get_logger().info('Goal Reached')
             self.succeed = True
             self.done = True
-            if ROS_DISTRO == 'humble':
-                self.cmd_vel_pub.publish(Twist())
-            else:
-                self.cmd_vel_pub.publish(TwistStamped())
+            self._stop_robot()
             self.local_step = 0
             self.call_task_succeed()
 
@@ -321,10 +287,7 @@ class RLEnvironment(Node):
             self.get_logger().info('Collision happened')
             self.fail = True
             self.done = True
-            if ROS_DISTRO == 'humble':
-                self.cmd_vel_pub.publish(Twist())
-            else:
-                self.cmd_vel_pub.publish(TwistStamped())
+            self._stop_robot()
             self.local_step = 0
             self.call_task_failed()
 
@@ -332,10 +295,7 @@ class RLEnvironment(Node):
             self.get_logger().info('Time out!')
             self.fail = True
             self.done = True
-            if ROS_DISTRO == 'humble':
-                self.cmd_vel_pub.publish(Twist())
-            else:
-                self.cmd_vel_pub.publish(TwistStamped())
+            self._stop_robot()
             self.local_step = 0
             self.call_task_failed()
 
@@ -421,10 +381,7 @@ class RLEnvironment(Node):
 
     def timer_callback(self):
         self.get_logger().info('Stop called')
-        if ROS_DISTRO == 'humble':
-            self.cmd_vel_pub.publish(Twist())
-        else:
-            self.cmd_vel_pub.publish(TwistStamped())
+        self._stop_robot()
         self.destroy_timer(self.stop_cmd_vel_timer)
 
     def parse_penalty_zones(self, entries):

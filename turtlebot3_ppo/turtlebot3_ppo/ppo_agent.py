@@ -1,23 +1,9 @@
 #!/usr/bin/env python3
-#################################################################################
-# Copyright 2019 ROBOTIS CO., LTD.
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#################################################################################
 #
 # PPO (Proximal Policy Optimization) agent for TurtleBot3 navigation.
 # Continuous 2D action space: [linear_vel, angular_vel].
-# Separate actor/critic networks, Gaussian policy, GAE, LR linear decay.
+# Separate actor/critic networks (64x64 Tanh), Gaussian policy, GAE,
+# LR linear decay, observation and return normalization.
 
 import datetime
 import os
@@ -36,9 +22,6 @@ from torch.distributions import Normal
 from torch.utils.tensorboard import SummaryWriter
 
 from turtlebot3_msgs.srv import Ppo
-
-
-current_time = datetime.datetime.now().strftime('[%mm%dd-%H:%M]')
 
 
 class Actor(nn.Module):
@@ -277,23 +260,18 @@ class PPOAgent(Node):
             lr=self.learning_rate, eps=1e-5
         )
 
-        run_experiment = experiment_name if experiment_name else 'default'
-        if checkpoint_dir or tensorboard_dir:
-            if checkpoint_dir:
-                self.model_dir_path = checkpoint_dir
-                self.run_dir = os.path.dirname(self.model_dir_path)
-            else:
-                self.run_dir = os.path.dirname(tensorboard_dir)
-                self.model_dir_path = os.path.join(self.run_dir, 'checkpoints')
+        # Resolve run directory from launch script args or fall back to manual layout
+        if checkpoint_dir:
+            self.model_dir_path = checkpoint_dir
+            self.run_dir = os.path.dirname(self.model_dir_path)
+        elif tensorboard_dir:
+            self.run_dir = os.path.dirname(tensorboard_dir)
+            self.model_dir_path = os.path.join(self.run_dir, 'checkpoints')
         else:
-            if not run_id:
-                run_id = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+            run_id = run_id or datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
             self.run_dir = os.path.join(
-                os.path.expanduser('~'),
-                'turtlebot3_runs',
-                'manual',
-                run_experiment,
-                run_id,
+                os.path.expanduser('~'), 'turtlebot3_runs', 'manual',
+                experiment_name or 'default', run_id,
             )
             self.model_dir_path = os.path.join(self.run_dir, 'checkpoints')
         os.makedirs(self.model_dir_path, exist_ok=True)
@@ -302,14 +280,11 @@ class PPOAgent(Node):
         if model_file:
             model_path = os.path.join(self.model_dir_path, model_file)
             checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
-            if 'actor_state' in checkpoint:
-                self.actor.load_state_dict(checkpoint['actor_state'])
-                self.critic.load_state_dict(checkpoint['critic_state'])
-                if 'obs_rms' in checkpoint:
-                    self.obs_rms.load_state_dict(checkpoint['obs_rms'])
-                    self.ret_rms.load_state_dict(checkpoint['ret_rms'])
-            else:
-                self.get_logger().warn('Legacy checkpoint format — skipping load')
+            self.actor.load_state_dict(checkpoint['actor_state'])
+            self.critic.load_state_dict(checkpoint['critic_state'])
+            if 'obs_rms' in checkpoint:
+                self.obs_rms.load_state_dict(checkpoint['obs_rms'])
+                self.ret_rms.load_state_dict(checkpoint['ret_rms'])
             self.load_episode = checkpoint.get('trained_episodes', 0)
             self.get_logger().info(f'Loaded model from {model_path} (episode {self.load_episode})')
 
@@ -422,7 +397,7 @@ class PPOAgent(Node):
         """Run PPO update for n_epochs over the rollout buffer."""
         n = len(self.buffer.states)
 
-        states_np = numpy.array(self.buffer.states).squeeze(axis=1)       # (n, 50)
+        states_np = numpy.array(self.buffer.states).squeeze(axis=1)
         actions_raw_np = numpy.array(self.buffer.actions_raw).squeeze(1)  # (n, 2)
         old_log_probs_np = numpy.array(self.buffer.log_probs)             # (n,)
         advantages_np = numpy.array(advantages, dtype=numpy.float32)
@@ -719,7 +694,7 @@ class PPOAgent(Node):
         """Write hyperparameters to config.txt inside the TensorBoard log dir."""
         config_path = os.path.join(log_dir, 'config.txt')
         with open(config_path, 'w') as f:
-            f.write(f'Date: {current_time}\n')
+            f.write(f'Date: {datetime.datetime.now():%Y-%m-%d %H:%M}\n')
             f.write(f'Max episodes: {self.max_training_episodes}\n')
             f.write(f'Device: {self.device}\n\n')
             f.write('=== PPO Hyperparameters ===\n')
