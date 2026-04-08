@@ -44,8 +44,16 @@ class GazeboInterface(Node):
                 'goal_pose': (2.0, 1.0),
                 'reset_robot_on_success': True,
             },
+            'zone_approach_hard': {
+                'goal_pose': (3.0, 1.0),
+                'reset_robot_on_success': True,
+            },
             'zone_corridor': {
                 'goal_pose': (3.5, -0.5),
+                'reset_robot_on_success': True,
+            },
+            'zone_corridor_narrow': {
+                'goal_pose': (4.0, -0.7),
                 'reset_robot_on_success': True,
             },
             'zone_goal': {

@@ -29,16 +29,26 @@ class Actor(nn.Module):
     Policy network (separate from critic).
 
     Net: state -> 64 -> tanh -> 64 -> tanh -> action_mean
-    Outputs mean of Gaussian; log_std is a clamped learnable parameter.
+    Outputs mean of Gaussian; log_std is a bounded learnable parameter.
 
     Actions are squashed via tanh:
       linear_vel  = 0.11 + 0.11 * tanh(raw[0])  -> [0.0, 0.22] m/s
       angular_vel = angular_vel_max * tanh(raw[1])
     """
 
-    def __init__(self, state_size, action_size, angular_vel_max=2.84):
+    def __init__(
+        self,
+        state_size,
+        action_size,
+        angular_vel_max=2.84,
+        log_std_init=-0.5,
+        log_std_min=-4.0,
+        log_std_max=1.0,
+    ):
         super().__init__()
         self.angular_vel_max = angular_vel_max
+        self.log_std_min = float(log_std_min)
+        self.log_std_max = float(log_std_max)
 
         self.net = nn.Sequential(
             nn.Linear(state_size, 64),
@@ -47,7 +57,9 @@ class Actor(nn.Module):
             nn.Tanh(),
         )
         self.mean = nn.Linear(64, action_size)
-        self.log_std = nn.Parameter(torch.zeros(action_size))
+        self.log_std = nn.Parameter(
+            torch.full((action_size,), float(log_std_init), dtype=torch.float32)
+        )
 
         for layer in self.net:
             if isinstance(layer, nn.Linear):
@@ -56,8 +68,11 @@ class Actor(nn.Module):
         nn.init.orthogonal_(self.mean.weight, gain=0.01)
         nn.init.zeros_(self.mean.bias)
 
+    def _clamped_log_std(self):
+        return torch.clamp(self.log_std, self.log_std_min, self.log_std_max)
+
     def _clamped_std(self):
-        return torch.clamp(self.log_std, -2.0, 0.5).exp()
+        return self._clamped_log_std().exp()
 
     def forward(self, state):
         return self.mean(self.net(state))
@@ -213,15 +228,23 @@ class PPOAgent(Node):
         self.declare_parameter('minibatch_size', 64)
         self.declare_parameter('value_coeff', 0.5)
         self.declare_parameter('entropy_coeff', 0.01)
+        self.declare_parameter('entropy_coeff_final', 0.001)
         self.declare_parameter('max_grad_norm', 0.5)
+        self.declare_parameter('target_kl', 0.015)
+        self.declare_parameter('use_clipped_value_loss', True)
+        self.declare_parameter('value_clip_epsilon', 0.2)
         self.declare_parameter('save_interval', 100)
         self.declare_parameter('eval_interval', 100)
-        self.declare_parameter('eval_episodes', 5)
+        self.declare_parameter('eval_episodes', 20)
         self.declare_parameter('eval_deterministic', True)
         self.declare_parameter('save_best_eval', True)
         self.declare_parameter('angular_vel_max', 2.84)
         self.declare_parameter('action_smoothing', 0.0)
         self.declare_parameter('lidar_state_size', 48)
+        self.declare_parameter('normalize_rewards', False)
+        self.declare_parameter('log_std_init', -0.5)
+        self.declare_parameter('log_std_min', -4.0)
+        self.declare_parameter('log_std_max', 1.0)
 
         self.max_training_episodes = self.get_parameter(
             'max_training_episodes'
@@ -244,7 +267,17 @@ class PPOAgent(Node):
         self.minibatch_size = self.get_parameter('minibatch_size').get_parameter_value().integer_value
         self.value_coeff = self.get_parameter('value_coeff').get_parameter_value().double_value
         self.entropy_coeff = self.get_parameter('entropy_coeff').get_parameter_value().double_value
+        self.entropy_coeff_final = self.get_parameter(
+            'entropy_coeff_final'
+        ).get_parameter_value().double_value
         self.max_grad_norm = self.get_parameter('max_grad_norm').get_parameter_value().double_value
+        self.target_kl = self.get_parameter('target_kl').get_parameter_value().double_value
+        self.use_clipped_value_loss = self.get_parameter(
+            'use_clipped_value_loss'
+        ).get_parameter_value().bool_value
+        self.value_clip_epsilon = self.get_parameter(
+            'value_clip_epsilon'
+        ).get_parameter_value().double_value
         self.save_interval = self.get_parameter('save_interval').get_parameter_value().integer_value
         self.eval_interval = max(
             0, self.get_parameter('eval_interval').get_parameter_value().integer_value
@@ -261,6 +294,12 @@ class PPOAgent(Node):
         self.angular_vel_max = self.get_parameter('angular_vel_max').get_parameter_value().double_value
         self.action_smoothing = self.get_parameter('action_smoothing').get_parameter_value().double_value
         self.lidar_state_size = self.get_parameter('lidar_state_size').get_parameter_value().integer_value
+        self.normalize_rewards = self.get_parameter(
+            'normalize_rewards'
+        ).get_parameter_value().bool_value
+        self.log_std_init = self.get_parameter('log_std_init').get_parameter_value().double_value
+        self.log_std_min = self.get_parameter('log_std_min').get_parameter_value().double_value
+        self.log_std_max = self.get_parameter('log_std_max').get_parameter_value().double_value
 
         self.device = torch.device(
             'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
@@ -300,8 +339,14 @@ class PPOAgent(Node):
 
         # Separate actor and critic networks
         self.initial_lr = self.learning_rate
+        self.initial_entropy_coeff = self.entropy_coeff
         self.actor = Actor(
-            self.state_size, self.action_size, angular_vel_max=self.angular_vel_max
+            self.state_size,
+            self.action_size,
+            angular_vel_max=self.angular_vel_max,
+            log_std_init=self.log_std_init,
+            log_std_min=self.log_std_min,
+            log_std_max=self.log_std_max,
         ).to(self.device)
         self.critic = Critic(self.state_size).to(self.device)
         self.optimizer = optim.Adam(
@@ -606,6 +651,7 @@ class PPOAgent(Node):
         states_np = numpy.array(self.buffer.states).squeeze(axis=1)
         actions_raw_np = numpy.array(self.buffer.actions_raw).squeeze(1)  # (n, 2)
         old_log_probs_np = numpy.array(self.buffer.log_probs)             # (n,)
+        old_values_np = numpy.array(self.buffer.values, dtype=numpy.float32)
         advantages_np = numpy.array(advantages, dtype=numpy.float32)
         returns_np = numpy.array(returns, dtype=numpy.float32)
 
@@ -615,6 +661,7 @@ class PPOAgent(Node):
         states_t = torch.FloatTensor(states_np).to(self.device)
         actions_raw_t = torch.FloatTensor(actions_raw_np).to(self.device)
         old_log_probs_t = torch.FloatTensor(old_log_probs_np).to(self.device)
+        old_values_t = torch.FloatTensor(old_values_np).to(self.device)
         advantages_t = torch.FloatTensor(advantages_np).to(self.device)
         returns_t = torch.FloatTensor(returns_np).to(self.device)
 
@@ -624,6 +671,7 @@ class PPOAgent(Node):
         total_clip_fraction = 0.0
         total_approx_kl = 0.0
         num_updates = 0
+        stopped_early = False
 
         indices = numpy.arange(n)
         for _ in range(self.n_epochs):
@@ -636,6 +684,7 @@ class PPOAgent(Node):
                 mb_states = states_t[mb_idx]
                 mb_actions_raw = actions_raw_t[mb_idx]
                 mb_old_log_probs = old_log_probs_t[mb_idx]
+                mb_old_values = old_values_t[mb_idx]
                 mb_advantages = advantages_t[mb_idx]
                 mb_returns = returns_t[mb_idx]
 
@@ -652,7 +701,19 @@ class PPOAgent(Node):
                 policy_loss = -torch.min(surr1, surr2).mean()
 
                 # Value loss (MSE)
-                value_loss = nn.functional.mse_loss(new_values, mb_returns)
+                if self.use_clipped_value_loss:
+                    value_pred_clipped = mb_old_values + torch.clamp(
+                        new_values - mb_old_values,
+                        -self.value_clip_epsilon,
+                        self.value_clip_epsilon,
+                    )
+                    value_loss_unclipped = (new_values - mb_returns).pow(2)
+                    value_loss_clipped = (value_pred_clipped - mb_returns).pow(2)
+                    value_loss = 0.5 * torch.max(
+                        value_loss_unclipped, value_loss_clipped
+                    ).mean()
+                else:
+                    value_loss = nn.functional.mse_loss(new_values, mb_returns)
 
                 # Entropy bonus
                 entropy_loss = -entropy.mean()
@@ -676,6 +737,16 @@ class PPOAgent(Node):
                 total_approx_kl += approx_kl
                 num_updates += 1
 
+                if self.target_kl > 0.0 and approx_kl > 1.5 * self.target_kl:
+                    stopped_early = True
+                    break
+            if stopped_early:
+                self.get_logger().info(
+                    'Early stopping PPO update due to KL: %.5f > %.5f'
+                    % (approx_kl, 1.5 * self.target_kl)
+                )
+                break
+
         if num_updates > 0:
             return {
                 'policy_loss': total_policy_loss / num_updates,
@@ -683,11 +754,23 @@ class PPOAgent(Node):
                 'entropy': total_entropy / num_updates,
                 'clip_fraction': total_clip_fraction / num_updates,
                 'approx_kl': total_approx_kl / num_updates,
+                'stopped_early': 1.0 if stopped_early else 0.0,
             }
         return {
             'policy_loss': 0.0, 'value_loss': 0.0, 'entropy': 0.0,
-            'clip_fraction': 0.0, 'approx_kl': 0.0,
+            'clip_fraction': 0.0, 'approx_kl': 0.0, 'stopped_early': 0.0,
         }
+
+    def _apply_schedules(self, episode):
+        frac = max(0.0, 1.0 - (episode / self.max_training_episodes))
+        self.learning_rate = self.initial_lr * frac
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = self.learning_rate
+
+        self.entropy_coeff = (
+            self.entropy_coeff_final
+            + (self.initial_entropy_coeff - self.entropy_coeff_final) * frac
+        )
 
     # ------------------------------------------------------------------
     # Main training loop
@@ -737,10 +820,12 @@ class PPOAgent(Node):
 
                 next_state, reward, done, zone_failed = self.step(action_np)
 
-                # Normalize reward by running return std
-                self.ret_running = self.ret_running * self.gamma + reward
-                self.ret_rms.update(numpy.array([self.ret_running]))
-                norm_reward = reward / (numpy.sqrt(self.ret_rms.var) + 1e-8)
+                if self.normalize_rewards:
+                    self.ret_running = self.ret_running * self.gamma + reward
+                    self.ret_rms.update(numpy.array([self.ret_running]))
+                    norm_reward = reward / (numpy.sqrt(self.ret_rms.var) + 1e-8)
+                else:
+                    norm_reward = reward
 
                 # Publish live action info
                 msg = Float32MultiArray()
@@ -836,6 +921,8 @@ class PPOAgent(Node):
             else:
                 explained_var = 0.0
 
+            self._apply_schedules(episode)
+
             rollout_start_time = time.time()
             metrics = self.ppo_update(advantages, returns)
             update_time = time.time() - rollout_start_time
@@ -859,25 +946,26 @@ class PPOAgent(Node):
             msg.data = [float(ep_reward), float(policy_loss), float(value_loss), float(entropy)]
             self.result_pub.publish(msg)
 
-            # Linear LR decay
-            frac = 1.0 - (episode / self.max_training_episodes)
-            self.learning_rate = self.initial_lr * max(frac, 0.0)
-            for param_group in self.optimizer.param_groups:
-                param_group['lr'] = self.learning_rate
-
             if self.logging:
                 self.writer.add_scalar('ppo/policy_loss', policy_loss, rollout_num)
                 self.writer.add_scalar('ppo/value_loss', value_loss, rollout_num)
                 self.writer.add_scalar('ppo/entropy', entropy, rollout_num)
+                self.writer.add_scalar('ppo/entropy_coeff', self.entropy_coeff, rollout_num)
                 self.writer.add_scalar('ppo/clip_fraction', metrics['clip_fraction'], rollout_num)
                 self.writer.add_scalar('ppo/approx_kl', metrics['approx_kl'], rollout_num)
+                self.writer.add_scalar('ppo/target_kl', self.target_kl, rollout_num)
+                self.writer.add_scalar(
+                    'ppo/early_stop_due_to_kl', metrics['stopped_early'], rollout_num
+                )
                 self.writer.add_scalar('ppo/explained_variance', explained_var, rollout_num)
                 self.writer.add_scalar('ppo/learning_rate', self.learning_rate, rollout_num)
                 with torch.no_grad():
                     std_mean = self.actor._clamped_std().mean().item()
-                    log_std_mean = self.actor.log_std.mean().item()
+                    log_std_mean = self.actor._clamped_log_std().mean().item()
+                    log_std_raw_mean = self.actor.log_std.mean().item()
                 self.writer.add_scalar('ppo/action_std', std_mean, rollout_num)
-                self.writer.add_scalar('ppo/log_std_raw', log_std_mean, rollout_num)
+                self.writer.add_scalar('ppo/log_std', log_std_mean, rollout_num)
+                self.writer.add_scalar('ppo/log_std_raw', log_std_raw_mean, rollout_num)
 
         if (
             self.eval_interval > 0
@@ -896,14 +984,17 @@ class PPOAgent(Node):
             f.write('=== PPO Hyperparameters ===\n')
             for name in ['gamma', 'gae_lambda', 'clip_epsilon', 'learning_rate',
                          'rollout_steps', 'n_epochs', 'minibatch_size',
-                         'value_coeff', 'entropy_coeff', 'max_grad_norm',
+                         'value_coeff', 'entropy_coeff', 'entropy_coeff_final',
+                         'max_grad_norm', 'target_kl', 'use_clipped_value_loss',
+                         'value_clip_epsilon', 'normalize_rewards',
                          'eval_interval', 'eval_episodes', 'eval_deterministic',
                          'save_best_eval',
-                         'angular_vel_max', 'lidar_state_size']:
+                         'angular_vel_max', 'lidar_state_size',
+                         'log_std_init', 'log_std_min', 'log_std_max']:
                 f.write(f'{name} = {getattr(self, name)}\n')
             with torch.no_grad():
-                log_std = self.actor.log_std.tolist()
-            f.write(f'log_std_init = {log_std}\n')
+                log_std = self.actor._clamped_log_std().tolist()
+            f.write(f'log_std = {log_std}\n')
             f.write(f'\n=== Network ===\n')
             f.write(f'state_size = {self.state_size}\n')
             f.write(f'action_size = {self.action_size}\n')
