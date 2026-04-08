@@ -221,6 +221,7 @@ class PPOAgent(Node):
         self.declare_parameter('save_best_eval', True)
         self.declare_parameter('angular_vel_max', 2.84)
         self.declare_parameter('action_smoothing', 0.0)
+        self.declare_parameter('lidar_state_size', 48)
 
         self.max_training_episodes = self.get_parameter(
             'max_training_episodes'
@@ -259,26 +260,15 @@ class PPOAgent(Node):
         ).get_parameter_value().bool_value
         self.angular_vel_max = self.get_parameter('angular_vel_max').get_parameter_value().double_value
         self.action_smoothing = self.get_parameter('action_smoothing').get_parameter_value().double_value
+        self.lidar_state_size = self.get_parameter('lidar_state_size').get_parameter_value().integer_value
 
         self.device = torch.device(
             'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
         )
         self.get_logger().info(f'Using device: {self.device}')
 
-        # Dimensions: [goal_dist, goal_angle, linear_vel, angular_vel, 48 lidar rays]
-        self.state_size = 52
+        self.state_size = None
         self.action_size = 2  # [linear_vel, angular_vel]
-
-        # Separate actor and critic networks
-        self.initial_lr = self.learning_rate
-        self.actor = Actor(
-            self.state_size, self.action_size, angular_vel_max=self.angular_vel_max
-        ).to(self.device)
-        self.critic = Critic(self.state_size).to(self.device)
-        self.optimizer = optim.Adam(
-            list(self.actor.parameters()) + list(self.critic.parameters()),
-            lr=self.learning_rate, eps=1e-5
-        )
 
         # Resolve run directory from launch script args or fall back to manual layout
         if checkpoint_dir:
@@ -295,6 +285,29 @@ class PPOAgent(Node):
             )
             self.model_dir_path = os.path.join(self.run_dir, 'checkpoints')
         os.makedirs(self.model_dir_path, exist_ok=True)
+
+        # ROS clients and publishers
+        self.rl_agent_interface_client = self.create_client(Ppo, 'rl_agent_interface')
+        self.make_environment_client = self.create_client(Empty, 'make_environment')
+        self.reset_environment_client = self.create_client(Ppo, 'reset_environment')
+
+        self.action_pub = self.create_publisher(Float32MultiArray, '/ppo_action', 10)
+        self.result_pub = self.create_publisher(Float32MultiArray, '/ppo_result', 10)
+
+        initial_state = self.initialize_environment_state()
+        self.state_size = initial_state.shape[1]
+        self.get_logger().info(f'Inferred state size from environment: {self.state_size}')
+
+        # Separate actor and critic networks
+        self.initial_lr = self.learning_rate
+        self.actor = Actor(
+            self.state_size, self.action_size, angular_vel_max=self.angular_vel_max
+        ).to(self.device)
+        self.critic = Critic(self.state_size).to(self.device)
+        self.optimizer = optim.Adam(
+            list(self.actor.parameters()) + list(self.critic.parameters()),
+            lr=self.learning_rate, eps=1e-5
+        )
 
         # Observation and return normalization (a la SB3 VecNormalize)
         self.obs_rms = RunningMeanStd(shape=(self.state_size,))
@@ -328,18 +341,10 @@ class PPOAgent(Node):
         self.best_eval_metrics = None
         self.last_eval_episode = None
 
-        # ROS clients and publishers
-        self.rl_agent_interface_client = self.create_client(Ppo, 'rl_agent_interface')
-        self.make_environment_client = self.create_client(Empty, 'make_environment')
-        self.reset_environment_client = self.create_client(Ppo, 'reset_environment')
-
-        self.action_pub = self.create_publisher(Float32MultiArray, '/ppo_action', 10)
-        self.result_pub = self.create_publisher(Float32MultiArray, '/ppo_result', 10)
-
         # Rollout buffer
         self.buffer = RolloutBuffer()
 
-        self.process()
+        self.process(initial_state)
 
     # ------------------------------------------------------------------
     # ROS environment interface
@@ -350,7 +355,42 @@ class PPOAgent(Node):
             self.get_logger().warn(
                 'make_environment service not available, waiting ...'
             )
-        self.make_environment_client.call_async(Empty.Request())
+        future = self.make_environment_client.call_async(Empty.Request())
+        rclpy.spin_until_future_complete(self, future)
+        if future.result() is None:
+            self.get_logger().error('make_environment call failed')
+
+    def _reshape_env_state(self, state_values):
+        state = numpy.asarray(state_values, dtype=numpy.float32)
+        if state.ndim == 0:
+            state = numpy.asarray([], dtype=numpy.float32)
+        if state.size == 0:
+            width = self.state_size if self.state_size is not None else 0
+            return numpy.zeros((1, width), dtype=numpy.float32)
+        if self.state_size is not None and state.size != self.state_size:
+            raise RuntimeError(
+                f'Environment state size mismatch: expected {self.state_size}, got {state.size}'
+            )
+        return state.reshape(1, state.size)
+
+    def initialize_environment_state(self):
+        self.env_make()
+        time.sleep(1.0)
+        min_state_size = 4 + self.lidar_state_size
+        for attempt in range(20):
+            state = self.reset_environment()
+            if state.shape[1] >= min_state_size:
+                time.sleep(1.0)
+                return state
+            self.get_logger().warn(
+                f'Initialization state too small ({state.shape[1]} < {min_state_size}), '
+                f'waiting for lidar data (attempt {attempt + 1}/20)'
+            )
+            time.sleep(0.25)
+        raise RuntimeError(
+            f'Environment returned incomplete state during initialization '
+            f'(expected at least {min_state_size}, got {state.shape[1]})'
+        )
 
     def reset_environment(self):
         while not self.reset_environment_client.wait_for_service(timeout_sec=1.0):
@@ -361,10 +401,11 @@ class PPOAgent(Node):
         rclpy.spin_until_future_complete(self, future)
         result = future.result()
         if result is not None:
-            state = numpy.reshape(numpy.asarray(result.state), [1, self.state_size])
+            state = self._reshape_env_state(result.state)
         else:
             self.get_logger().error('reset_environment call failed')
-            state = numpy.zeros([1, self.state_size])
+            width = self.state_size if self.state_size is not None else 0
+            state = numpy.zeros((1, width), dtype=numpy.float32)
         return state
 
     def step(self, action):
@@ -380,28 +421,34 @@ class PPOAgent(Node):
 
         result = future.result()
         if result is not None:
-            next_state = numpy.reshape(numpy.asarray(result.state), [1, self.state_size])
+            next_state = self._reshape_env_state(result.state)
             reward = float(result.reward)
             done = bool(result.done)
-            zone_steps = int(result.zone_steps)
-            zone_entered = bool(result.zone_entered)
+            zone_failed = bool(result.zone_failed)
         else:
             self.get_logger().error('rl_agent_interface call failed')
-            next_state = numpy.zeros([1, self.state_size])
+            next_state = numpy.zeros((1, self.state_size), dtype=numpy.float32)
             reward = 0.0
             done = False
-            zone_steps = 0
-            zone_entered = False
+            zone_failed = False
 
-        return next_state, reward, done, zone_steps, zone_entered
+        return next_state, reward, done, zone_failed
 
-    def classify_outcome(self, reward, next_state):
-        goal_dist = float(next_state[0][0])
+    def classify_outcome(self, reward, next_state, zone_failed=False):
+        goal_dist = float(next_state[0][0]) if next_state.size else float('inf')
         if reward == 100.0:
             outcome = 'success'
         elif reward == -50.0:
-            min_lidar = float(numpy.min(next_state[0][4:]))
-            outcome = 'collision' if min_lidar < 0.20 else 'timeout'
+            lidar_start = 4
+            lidar_end = min(lidar_start + self.lidar_state_size, next_state.shape[1])
+            lidar_window = next_state[0][lidar_start:lidar_end]
+            min_lidar = float(numpy.min(lidar_window)) if lidar_window.size else float('inf')
+            if min_lidar < 0.20:
+                outcome = 'collision'
+            elif zone_failed:
+                outcome = 'zone'
+            else:
+                outcome = 'timeout'
         else:
             outcome = 'timeout'
         return outcome, goal_dist
@@ -427,21 +474,20 @@ class PPOAgent(Node):
                 action_np = (1.0 - alpha) * action_np + alpha * prev_action
             prev_action = action_np.copy()
 
-            next_state, reward, done, zone_steps, zone_entered = self.step(action_np)
+            next_state, reward, done, zone_failed = self.step(action_np)
             ep_reward += reward
             ep_steps += 1
             state = next_state
 
             if done:
-                outcome, goal_dist = self.classify_outcome(reward, next_state)
+                outcome, goal_dist = self.classify_outcome(reward, next_state, zone_failed)
                 return {
                     'reward': ep_reward,
                     'length': ep_steps,
                     'goal_distance_at_end': goal_dist,
-                    'zone_steps': zone_steps,
-                    'zone_entered': float(zone_entered),
                     'success': 1.0 if outcome == 'success' else 0.0,
                     'collision': 1.0 if outcome == 'collision' else 0.0,
+                    'zone_fail': 1.0 if outcome == 'zone' else 0.0,
                     'timeout': 1.0 if outcome == 'timeout' else 0.0,
                 }
 
@@ -468,21 +514,19 @@ class PPOAgent(Node):
         summary = {
             'success_rate': sum(m['success'] for m in episode_metrics) / len(episode_metrics),
             'collision_rate': sum(m['collision'] for m in episode_metrics) / len(episode_metrics),
+            'zone_fail_rate': sum(m['zone_fail'] for m in episode_metrics) / len(episode_metrics),
             'timeout_rate': sum(m['timeout'] for m in episode_metrics) / len(episode_metrics),
             'episode_reward_mean': sum(m['reward'] for m in episode_metrics) / len(episode_metrics),
             'episode_length_mean': sum(m['length'] for m in episode_metrics) / len(episode_metrics),
             'goal_distance_at_end_mean': (
                 sum(m['goal_distance_at_end'] for m in episode_metrics) / len(episode_metrics)
             ),
-            'zone_steps_mean': sum(m['zone_steps'] for m in episode_metrics) / len(episode_metrics),
-            'zone_entry_rate': (
-                sum(m['zone_entered'] for m in episode_metrics) / len(episode_metrics)
-            ),
         }
 
         if self.logging:
             self.writer.add_scalar('ppo_eval/success_rate', summary['success_rate'], episode)
             self.writer.add_scalar('ppo_eval/collision_rate', summary['collision_rate'], episode)
+            self.writer.add_scalar('ppo_eval/zone_fail_rate', summary['zone_fail_rate'], episode)
             self.writer.add_scalar('ppo_eval/timeout_rate', summary['timeout_rate'], episode)
             self.writer.add_scalar(
                 'ppo_eval/episode_reward_mean', summary['episode_reward_mean'], episode
@@ -495,12 +539,10 @@ class PPOAgent(Node):
                 summary['goal_distance_at_end_mean'],
                 episode
             )
-            self.writer.add_scalar('ppo_eval/zone_steps_mean', summary['zone_steps_mean'], episode)
-            self.writer.add_scalar('ppo_eval/zone_entry_rate', summary['zone_entry_rate'], episode)
 
         score = (
             summary['success_rate'],
-            -summary['zone_entry_rate'],
+            -summary['zone_fail_rate'],
             -summary['collision_rate'],
             -summary['timeout_rate'],
             summary['episode_reward_mean'],
@@ -519,12 +561,12 @@ class PPOAgent(Node):
         self.last_eval_episode = episode
         self.get_logger().info(
             'Evaluation | episode: %d | success: %.1f%% | collision: %.1f%% | '
-            'timeout: %.1f%% | zone_entry: %.1f%% | mean_reward: %.2f%s' % (
+            'zone_fail: %.1f%% | timeout: %.1f%% | mean_reward: %.2f%s' % (
                 episode,
                 100.0 * summary['success_rate'],
                 100.0 * summary['collision_rate'],
+                100.0 * summary['zone_fail_rate'],
                 100.0 * summary['timeout_rate'],
-                100.0 * summary['zone_entry_rate'],
                 summary['episode_reward_mean'],
                 ' | new best' if is_best else ''
             )
@@ -651,10 +693,7 @@ class PPOAgent(Node):
     # Main training loop
     # ------------------------------------------------------------------
 
-    def process(self):
-        self.env_make()
-        time.sleep(1.0)
-
+    def process(self, initial_state=None):
         episode = self.load_episode
         global_step = 0
         ep_reward = 0.0
@@ -663,11 +702,8 @@ class PPOAgent(Node):
 
         # Rolling trackers for episode-level metrics
         recent_rewards = deque(maxlen=100)
-        recent_outcomes = deque(maxlen=100)  # 'success', 'collision', 'timeout'
-        recent_zone_entries = deque(maxlen=100)
-
-        state = self.reset_environment()
-        time.sleep(1.0)
+        recent_outcomes = deque(maxlen=100)  # 'success', 'collision', 'zone', 'timeout'
+        state = initial_state if initial_state is not None else self.initialize_environment_state()
         prev_action = None
 
         while episode < self.max_training_episodes:
@@ -699,7 +735,7 @@ class PPOAgent(Node):
                     action_np = (1.0 - alpha) * action_np + alpha * prev_action
                 prev_action = action_np.copy()
 
-                next_state, reward, done, zone_steps, zone_entered = self.step(action_np)
+                next_state, reward, done, zone_failed = self.step(action_np)
 
                 # Normalize reward by running return std
                 self.ret_running = self.ret_running * self.gamma + reward
@@ -725,18 +761,16 @@ class PPOAgent(Node):
                 if done:
                     episode += 1
 
-                    outcome, goal_dist = self.classify_outcome(reward, next_state)
+                    outcome, goal_dist = self.classify_outcome(reward, next_state, zone_failed)
 
                     recent_rewards.append(ep_reward)
                     recent_outcomes.append(outcome)
-                    recent_zone_entries.append(zone_entered)
 
                     print(
                         'Episode:', episode,
                         '| reward:', round(ep_reward, 2),
                         '| steps:', ep_steps,
-                        '| outcome:', outcome,
-                        '| zone_steps:', zone_steps
+                        '| outcome:', outcome
                     )
 
                     if self.logging:
@@ -753,19 +787,16 @@ class PPOAgent(Node):
                             sum(1 for o in recent_outcomes if o == 'collision') / n,
                             episode)
                         self.writer.add_scalar(
+                            'ppo/zone_fail_rate',
+                            sum(1 for o in recent_outcomes if o == 'zone') / n,
+                            episode)
+                        self.writer.add_scalar(
                             'ppo/timeout_rate',
                             sum(1 for o in recent_outcomes if o == 'timeout') / n,
                             episode)
                         self.writer.add_scalar(
                             'ppo/episode_reward_mean100',
                             sum(recent_rewards) / len(recent_rewards),
-                            episode)
-                        self.writer.add_scalar('ppo/zone_steps', zone_steps, episode)
-                        self.writer.add_scalar('ppo/zone_entered', float(zone_entered), episode)
-                        nz = len(recent_zone_entries)
-                        self.writer.add_scalar(
-                            'ppo/zone_entry_rate',
-                            sum(1 for z in recent_zone_entries if z) / nz,
                             episode)
 
                     ep_reward = 0.0
@@ -868,7 +899,7 @@ class PPOAgent(Node):
                          'value_coeff', 'entropy_coeff', 'max_grad_norm',
                          'eval_interval', 'eval_episodes', 'eval_deterministic',
                          'save_best_eval',
-                         'angular_vel_max']:
+                         'angular_vel_max', 'lidar_state_size']:
                 f.write(f'{name} = {getattr(self, name)}\n')
             with torch.no_grad():
                 log_std = self.actor.log_std.tolist()

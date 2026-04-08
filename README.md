@@ -206,7 +206,7 @@ ros2 run turtlebot3_dqn dqn_test \
 
 **`ppo_environment.py`** — Reward and state computation node.
 
-Reward at each step for the default `legacy` strategy:
+Reward at each nonterminal step:
 
 ```
 r = progress_scale × (d_prev − d_curr)          # goal progress
@@ -215,15 +215,7 @@ r = progress_scale × (d_prev − d_curr)          # goal progress
   + lyapunov_scale × (γ·Φ(s') − Φ(s))           # potential shaping (optional)
 ```
 
-Terminal: `+100.0` on success, `−50.0` on collision or timeout.
-
-The custom `simple_zone` strategy reduces this to:
-
-```
-r = progress_scale × (d_prev − d_curr) + zone_penalty
-```
-
-This is intended for keep-out tasks where yaw shaping and near-wall shaping can drown out the zone-avoidance signal.
+Terminal: `+100.0` on success, `−50.0` on collision, timeout, or danger-zone entry.
 
 **`ppo_gazebo.py`** — Gazebo interface for goal spawning and robot resets. Generates random goal positions within [−2.1, 2.1] m (stages 1–3), cycles through a fixed list (stage 4), and also supports named custom scenarios such as `warehouse_easy` with a fixed goal and full episode reset on success. Detects ROS 2 distro and uses the appropriate Gazebo API.
 
@@ -286,9 +278,8 @@ This is intended for keep-out tasks where yaw shaping and near-wall shaping can 
 | `reward_obstacle_safe_dist` | double | 0.6 | Distance (m) at which penalty is zero |
 | `reward_obstacle_danger_dist` | double | 0.15 | Distance (m) at which penalty is maximum |
 | `reward_success` | double | 100.0 | Terminal reward for reaching goal |
-| `reward_fail` | double | −50.0 | Terminal reward for collision or timeout |
-| `reward_strategy` | string | `legacy` | `legacy` uses progress+yaw+obstacle shaping; `simple_zone` uses only progress plus keep-out penalties |
-| `penalty_zones` | string[] | `['']` | Keep-out regions encoded as `"x_min,y_min,x_max,y_max,penalty"` for boxes or `"circle,x,y,radius,penalty"` for circular zones |
+| `reward_fail` | double | −50.0 | Terminal reward for collision, timeout, or danger-zone entry |
+| `danger_zones` | string[] | `['']` | Keep-out regions encoded as `"x_min,y_min,x_max,y_max"` for boxes or `"circle,x,y,radius"` for circular zones |
 | `max_step` | int | 800 | Episode timeout (steps) |
 | `goal_threshold` | double | 0.20 | Goal-reached distance (m) |
 | `collision_threshold` | double | 0.15 | Collision distance (m) |

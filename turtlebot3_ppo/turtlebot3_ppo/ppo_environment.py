@@ -2,8 +2,8 @@
 #
 # PPO environment node for TurtleBot3 navigation.
 # Receives continuous actions [linear_vel, angular_vel], computes reward,
-# returns next state (goal_dist, goal_angle, linear_vel, angular_vel, 48 lidar).
-# Supports configurable penalty zones for zone-avoidance training.
+# returns next state with goal, motion, lidar, and danger-zone observations.
+# Supports configurable danger zones for keep-out training.
 
 import math
 import os
@@ -51,7 +51,7 @@ class RLEnvironment(Node):
         self.declare_parameter('reward_obstacle_danger_dist', 0.15)
         self.declare_parameter('reward_success', 100.0)
         self.declare_parameter('reward_fail', -50.0)
-        self.declare_parameter('penalty_zones', [''])
+        self.declare_parameter('danger_zones', [''])
 
         # Environment parameters
         self.declare_parameter('max_step', 800)
@@ -67,15 +67,17 @@ class RLEnvironment(Node):
         self.reward_obstacle_danger_dist = self.get_parameter('reward_obstacle_danger_dist').get_parameter_value().double_value
         self.reward_success = self.get_parameter('reward_success').get_parameter_value().double_value
         self.reward_fail = self.get_parameter('reward_fail').get_parameter_value().double_value
-        penalty_zone_entries = self.get_parameter(
-            'penalty_zones'
+        danger_zone_entries = self.get_parameter(
+            'danger_zones'
         ).get_parameter_value().string_array_value
         self.max_step = self.get_parameter('max_step').get_parameter_value().integer_value
         self.goal_threshold = self.get_parameter('goal_threshold').get_parameter_value().double_value
         self.collision_threshold = self.get_parameter('collision_threshold').get_parameter_value().double_value
         self.angular_vel_max = self.get_parameter('angular_vel_max').get_parameter_value().double_value
         self.lyapunov_scale = self.get_parameter('lyapunov_scale').get_parameter_value().double_value
-        self.penalty_zones = self.parse_penalty_zones(penalty_zone_entries)
+        self.danger_zones = self.parse_danger_zones(danger_zone_entries)
+        self.zone_mask_grid_size = 7
+        self.zone_mask_extent = 2.0
 
         self.goal_pose_x = 0.0
         self.goal_pose_y = 0.0
@@ -91,11 +93,11 @@ class RLEnvironment(Node):
         self.init_goal_distance = 0.5
         self.robot_linear_vel = 0.0
         self.robot_angular_vel = 0.0
+        self.robot_pose_theta = 0.0
         self.scan_ranges = []
         self.min_obstacle_distance = 10.0
 
-        self.zone_steps_in_episode = 0
-        self.zone_entered_in_episode = False
+        self.zone_failed = False
 
         self.local_step = 0
         self.stop_cmd_vel_timer = None
@@ -104,6 +106,14 @@ class RLEnvironment(Node):
         # At 10 Hz: 800 steps = 80 s of sim time regardless of real_time_factor.
         self.control_period = 0.1
         self.sim_time = 0.0
+
+        self.zone_mask_local_points = self._build_zone_mask_local_points()
+        if self.danger_zones:
+            self.get_logger().info('Danger-zone entry is configured as terminal failure')
+            self.get_logger().info(
+                'Danger-zone observation enabled: nearest features + %d-cell mask over +/- %.2f m'
+                % (len(self.zone_mask_local_points), self.zone_mask_extent)
+            )
 
         qos = QoSProfile(depth=10)
 
@@ -191,11 +201,14 @@ class RLEnvironment(Node):
         return response
 
     def reset_environment_callback(self, request, response):
-        state = self.calculate_state()
+        self.done = False
+        self.fail = False
+        self.succeed = False
+        self.local_step = 0
+        self.zone_failed = False
+        state = self.build_state()
         self.init_goal_distance = state[0]
         self.prev_goal_distance = self.init_goal_distance
-        self.zone_steps_in_episode = 0
-        self.zone_entered_in_episode = False
         response.state = state
 
         return response
@@ -266,32 +279,46 @@ class RLEnvironment(Node):
         else:
             self.cmd_vel_pub.publish(TwistStamped())
 
-    def calculate_state(self):
+    def build_state(self):
         state = [
             float(self.goal_distance),
             float(self.goal_angle),
             float(self.robot_linear_vel),
             float(self.robot_angular_vel),
-        ] + [float(r) for r in self.scan_ranges]
-        self.local_step += 1
+        ]
+        state.extend(float(r) for r in self.scan_ranges)
+        state.extend(self.build_zone_observation())
+        return state
 
-        if self.goal_distance < self.goal_threshold:
+    def calculate_state(self):
+        self.local_step += 1
+        in_zone = self.is_in_danger_zone()
+
+        state = self.build_state()
+
+        if in_zone:
+            self.get_logger().info('Danger zone entered')
+            self.zone_failed = True
+            self.fail = True
+            self.done = True
+            self._stop_robot()
+            self.local_step = 0
+            self.call_task_failed()
+        elif self.goal_distance < self.goal_threshold:
             self.get_logger().info('Goal Reached')
             self.succeed = True
             self.done = True
             self._stop_robot()
             self.local_step = 0
             self.call_task_succeed()
-
-        if self.min_obstacle_distance < self.collision_threshold:
+        elif self.min_obstacle_distance < self.collision_threshold:
             self.get_logger().info('Collision happened')
             self.fail = True
             self.done = True
             self._stop_robot()
             self.local_step = 0
             self.call_task_failed()
-
-        if self.local_step == self.max_step:
+        elif self.local_step >= self.max_step:
             self.get_logger().info('Time out!')
             self.fail = True
             self.done = True
@@ -321,12 +348,10 @@ class RLEnvironment(Node):
         else:
             lyapunov_reward = 0.0
 
-        zone_reward = self.calculate_penalty_zone_reward()
-
-        reward = progress_reward + yaw_reward + obstacle_reward + lyapunov_reward + zone_reward
+        reward = progress_reward + yaw_reward + obstacle_reward + lyapunov_reward
         print(
-            'progress: %.3f  yaw: %.3f  obstacle: %.3f  lyapunov: %.3f  zone: %.3f' % (
-                progress_reward, yaw_reward, obstacle_reward, lyapunov_reward, zone_reward
+            'progress: %.3f  yaw: %.3f  obstacle: %.3f  lyapunov: %.3f' % (
+                progress_reward, yaw_reward, obstacle_reward, lyapunov_reward
             )
         )
 
@@ -369,13 +394,13 @@ class RLEnvironment(Node):
         response.reward = self.calculate_reward()
         self.prev_goal_distance = self.goal_distance
         response.done = self.done
-        response.zone_steps = self.zone_steps_in_episode
-        response.zone_entered = self.zone_entered_in_episode
+        response.zone_failed = self.zone_failed
 
         if self.done is True:
             self.done = False
             self.succeed = False
             self.fail = False
+            self.zone_failed = False
 
         return response
 
@@ -384,7 +409,7 @@ class RLEnvironment(Node):
         self._stop_robot()
         self.destroy_timer(self.stop_cmd_vel_timer)
 
-    def parse_penalty_zones(self, entries):
+    def parse_danger_zones(self, entries):
         zones = []
         for index, entry in enumerate(entries):
             entry = entry.strip()
@@ -393,20 +418,18 @@ class RLEnvironment(Node):
 
             tokens = [token.strip() for token in entry.split(',')]
             if tokens[0] == 'circle':
-                if len(tokens) != 5:
+                if len(tokens) != 4:
                     raise ValueError(
-                        'penalty_zones[%d] circle format is "circle,x,y,radius,penalty"' % index
+                        'danger_zones[%d] circle format is "circle,x,y,radius"' % index
                     )
                 center_x = float(tokens[1])
                 center_y = float(tokens[2])
                 radius = float(tokens[3])
-                penalty = float(tokens[4])
                 zones.append({
                     'type': 'circle',
                     'center_x': center_x,
                     'center_y': center_y,
                     'radius': radius,
-                    'penalty': penalty,
                 })
                 continue
 
@@ -415,48 +438,140 @@ class RLEnvironment(Node):
             else:
                 values = [float(token) for token in tokens]
 
-            if len(values) != 5:
+            if len(values) != 4:
                 raise ValueError(
-                    'penalty_zones[%d] must be "x_min,y_min,x_max,y_max,penalty" or '
-                    '"circle,x,y,radius,penalty"' % index
+                    'danger_zones[%d] must be "x_min,y_min,x_max,y_max" or '
+                    '"circle,x,y,radius"' % index
                 )
 
-            x_min, y_min, x_max, y_max, penalty = values
+            x_min, y_min, x_max, y_max = values
             zones.append({
                 'type': 'box',
                 'x_min': min(x_min, x_max),
                 'x_max': max(x_min, x_max),
                 'y_min': min(y_min, y_max),
                 'y_max': max(y_min, y_max),
-                'penalty': penalty,
             })
 
         if zones:
-            self.get_logger().info('Loaded %d penalty zone(s)' % len(zones))
+            self.get_logger().info('Loaded %d danger zone(s)' % len(zones))
         return zones
 
-    def calculate_penalty_zone_reward(self):
-        zone_reward = 0.0
-        in_zone = False
-        for zone in self.penalty_zones:
-            if zone['type'] == 'circle':
-                dx = self.robot_pose_x - zone['center_x']
-                dy = self.robot_pose_y - zone['center_y']
-                if dx * dx + dy * dy <= zone['radius'] * zone['radius']:
-                    zone_reward += zone['penalty']
-                    in_zone = True
+    def point_in_zone(self, x, y, zone):
+        if zone['type'] == 'circle':
+            dx = x - zone['center_x']
+            dy = y - zone['center_y']
+            return dx * dx + dy * dy <= zone['radius'] * zone['radius']
+
+        inside_x = zone['x_min'] <= x <= zone['x_max']
+        inside_y = zone['y_min'] <= y <= zone['y_max']
+        return inside_x and inside_y
+
+    def is_in_danger_zone(self):
+        return any(
+            self.point_in_zone(self.robot_pose_x, self.robot_pose_y, zone)
+            for zone in self.danger_zones
+        )
+
+    def build_zone_observation(self):
+        if not self.danger_zones:
+            return []
+
+        observation = []
+        signed_distance, relative_bearing = self.calculate_nearest_zone_features()
+        observation.extend([signed_distance, relative_bearing])
+        observation.extend(self.build_zone_mask())
+        return observation
+
+    def calculate_nearest_zone_features(self):
+        if not self.danger_zones:
+            return self.zone_mask_extent, 0.0
+
+        best_signed_distance = None
+        best_point = None
+        for zone in self.danger_zones:
+            signed_distance, nearest_point = self.signed_distance_and_nearest_point_to_zone(
+                self.robot_pose_x, self.robot_pose_y, zone
+            )
+            if best_signed_distance is None or signed_distance < best_signed_distance:
+                best_signed_distance = signed_distance
+                best_point = nearest_point
+
+        clipped_distance = float(
+            numpy.clip(best_signed_distance, -self.zone_mask_extent, self.zone_mask_extent)
+        )
+        world_bearing = math.atan2(
+            best_point[1] - self.robot_pose_y,
+            best_point[0] - self.robot_pose_x,
+        )
+        relative_bearing = self.wrap_angle(world_bearing - self.robot_pose_theta)
+        return clipped_distance, relative_bearing
+
+    def build_zone_mask(self):
+        if not self.danger_zones:
+            return [0.0] * len(self.zone_mask_local_points)
+
+        cos_yaw = math.cos(self.robot_pose_theta)
+        sin_yaw = math.sin(self.robot_pose_theta)
+        mask = []
+        for forward, lateral in self.zone_mask_local_points:
+            world_x = self.robot_pose_x + cos_yaw * forward - sin_yaw * lateral
+            world_y = self.robot_pose_y + sin_yaw * forward + cos_yaw * lateral
+            occupied = any(
+                self.point_in_zone(world_x, world_y, zone) for zone in self.danger_zones
+            )
+            mask.append(1.0 if occupied else 0.0)
+        return mask
+
+    def _build_zone_mask_local_points(self):
+        cell_size = (2.0 * self.zone_mask_extent) / self.zone_mask_grid_size
+        points = []
+        for row in range(self.zone_mask_grid_size):
+            forward = self.zone_mask_extent - (row + 0.5) * cell_size
+            for col in range(self.zone_mask_grid_size):
+                lateral = self.zone_mask_extent - (col + 0.5) * cell_size
+                points.append((forward, lateral))
+        return points
+
+    def signed_distance_and_nearest_point_to_zone(self, x, y, zone):
+        if zone['type'] == 'circle':
+            dx = x - zone['center_x']
+            dy = y - zone['center_y']
+            distance_to_center = math.hypot(dx, dy)
+            signed_distance = distance_to_center - zone['radius']
+            if distance_to_center > 1e-6:
+                scale = zone['radius'] / distance_to_center
+                nearest_point = (
+                    zone['center_x'] + dx * scale,
+                    zone['center_y'] + dy * scale,
+                )
             else:
-                inside_x = zone['x_min'] <= self.robot_pose_x <= zone['x_max']
-                inside_y = zone['y_min'] <= self.robot_pose_y <= zone['y_max']
-                if inside_x and inside_y:
-                    zone_reward += zone['penalty']
-                    in_zone = True
+                nearest_point = (zone['center_x'] + zone['radius'], zone['center_y'])
+            return signed_distance, nearest_point
 
-        if in_zone:
-            self.zone_steps_in_episode += 1
-            self.zone_entered_in_episode = True
+        clamped_x = float(numpy.clip(x, zone['x_min'], zone['x_max']))
+        clamped_y = float(numpy.clip(y, zone['y_min'], zone['y_max']))
+        outside_dx = max(zone['x_min'] - x, 0.0, x - zone['x_max'])
+        outside_dy = max(zone['y_min'] - y, 0.0, y - zone['y_max'])
+        outside_distance = math.hypot(outside_dx, outside_dy)
+        if outside_distance > 0.0:
+            return outside_distance, (clamped_x, clamped_y)
 
-        return zone_reward
+        distances_to_faces = [
+            (x - zone['x_min'], (zone['x_min'], y)),
+            (zone['x_max'] - x, (zone['x_max'], y)),
+            (y - zone['y_min'], (x, zone['y_min'])),
+            (zone['y_max'] - y, (x, zone['y_max'])),
+        ]
+        min_inside_distance, nearest_point = min(distances_to_faces, key=lambda item: item[0])
+        return -min_inside_distance, nearest_point
+
+    def wrap_angle(self, angle):
+        if angle > math.pi:
+            angle -= 2 * math.pi
+        elif angle < -math.pi:
+            angle += 2 * math.pi
+        return angle
 
     def euler_from_quaternion(self, quat):
         x = quat.x
