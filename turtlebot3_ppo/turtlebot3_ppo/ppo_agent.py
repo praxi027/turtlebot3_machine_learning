@@ -79,6 +79,11 @@ class Actor(nn.Module):
         entropy = dist.entropy().sum(dim=-1)
         return log_prob, entropy
 
+    def get_deterministic_action(self, state):
+        """Return squashed mean action (no sampling) for evaluation."""
+        mean = self.forward(state)
+        return self._squash(mean)
+
     def _squash(self, action_raw):
         linear = 0.11 + 0.11 * torch.tanh(action_raw[..., 0:1])   # [0.0, 0.22]
         angular = self.angular_vel_max * torch.tanh(action_raw[..., 1:2])
@@ -213,6 +218,8 @@ class PPOAgent(Node):
         self.declare_parameter('save_interval', 100)
         self.declare_parameter('angular_vel_max', 2.84)
         self.declare_parameter('action_smoothing', 0.0)
+        self.declare_parameter('eval_interval', 100)
+        self.declare_parameter('eval_episodes', 20)
 
         self.max_training_episodes = self.get_parameter(
             'max_training_episodes'
@@ -239,6 +246,8 @@ class PPOAgent(Node):
         self.save_interval = self.get_parameter('save_interval').get_parameter_value().integer_value
         self.angular_vel_max = self.get_parameter('angular_vel_max').get_parameter_value().double_value
         self.action_smoothing = self.get_parameter('action_smoothing').get_parameter_value().double_value
+        self.eval_interval = self.get_parameter('eval_interval').get_parameter_value().integer_value
+        self.eval_episodes = self.get_parameter('eval_episodes').get_parameter_value().integer_value
 
         self.device = torch.device(
             'cuda' if use_gpu and torch.cuda.is_available() else 'cpu'
@@ -313,6 +322,9 @@ class PPOAgent(Node):
 
         # Rollout buffer
         self.buffer = RolloutBuffer()
+
+        # Evaluation tracking
+        self.best_eval_success_rate = -1.0
 
         self.process()
 
@@ -622,6 +634,10 @@ class PPOAgent(Node):
                     if episode % self.save_interval == 0:
                         self._save_model(episode)
 
+                    if episode % self.eval_interval == 0:
+                        self.evaluate_policy(episode)
+                        state = self.reset_environment()
+
                     if episode >= self.max_training_episodes:
                         break
 
@@ -690,6 +706,10 @@ class PPOAgent(Node):
                 self.writer.add_scalar('ppo/action_std', std_mean, rollout_num)
                 self.writer.add_scalar('ppo/log_std_raw', log_std_mean, rollout_num)
 
+        # Final eval and model save
+        self._save_model(episode)
+        self.evaluate_policy(episode)
+
     def _save_config(self, log_dir):
         """Write hyperparameters to config.txt inside the TensorBoard log dir."""
         config_path = os.path.join(log_dir, 'config.txt')
@@ -701,7 +721,7 @@ class PPOAgent(Node):
             for name in ['gamma', 'gae_lambda', 'clip_epsilon', 'learning_rate',
                          'rollout_steps', 'n_epochs', 'minibatch_size',
                          'value_coeff', 'entropy_coeff', 'max_grad_norm',
-                         'angular_vel_max']:
+                         'angular_vel_max', 'eval_interval', 'eval_episodes']:
                 f.write(f'{name} = {getattr(self, name)}\n')
             with torch.no_grad():
                 log_std = self.actor.log_std.tolist()
@@ -728,6 +748,105 @@ class PPOAgent(Node):
             'trained_episodes': episode,
         }, model_path)
         self.get_logger().info(f'Model saved: {model_path} (episode {episode})')
+
+    def evaluate_policy(self, episode):
+        """Run eval_episodes deterministic episodes and log results."""
+        self.get_logger().info(
+            f'=== Evaluation at episode {episode} ({self.eval_episodes} episodes) ==='
+        )
+
+        outcomes = []
+        rewards = []
+        lengths = []
+        zone_entries = []
+        zone_step_counts = []
+
+        self.actor.eval()
+        for ep_i in range(self.eval_episodes):
+            state = self.reset_environment()
+            ep_reward = 0.0
+            ep_steps = 0
+
+            while True:
+                norm_state = self.obs_rms.normalize(state)
+                with torch.no_grad():
+                    state_t = torch.FloatTensor(norm_state).to(self.device)
+                    action = self.actor.get_deterministic_action(state_t)
+                action_np = action.cpu().numpy()
+
+                next_state, reward, done, zone_steps, zone_entered = self.step(action_np)
+                ep_reward += reward
+                ep_steps += 1
+                state = next_state
+
+                if done:
+                    if reward == 100.0:
+                        outcome = 'success'
+                    elif reward == -50.0:
+                        min_lidar = float(numpy.min(next_state[0][4:]))
+                        outcome = 'collision' if min_lidar < 0.20 else 'timeout'
+                    else:
+                        outcome = 'timeout'
+
+                    outcomes.append(outcome)
+                    rewards.append(ep_reward)
+                    lengths.append(ep_steps)
+                    zone_entries.append(zone_entered)
+                    zone_step_counts.append(zone_steps)
+
+                    print(
+                        f'  Eval {ep_i + 1}/{self.eval_episodes}:',
+                        outcome, '| reward:', round(ep_reward, 2),
+                        '| steps:', ep_steps, '| zone_steps:', zone_steps
+                    )
+                    break
+
+                time.sleep(0.01)
+
+        self.actor.train()
+
+        n = len(outcomes)
+        success_rate = sum(1 for o in outcomes if o == 'success') / n
+        collision_rate = sum(1 for o in outcomes if o == 'collision') / n
+        timeout_rate = sum(1 for o in outcomes if o == 'timeout') / n
+        mean_reward = sum(rewards) / n
+        mean_length = sum(lengths) / n
+        zone_entry_rate = sum(1 for z in zone_entries if z) / n
+        mean_zone_steps = sum(zone_step_counts) / n
+
+        print(
+            f'=== Eval results: success={success_rate:.0%}',
+            f'collision={collision_rate:.0%}',
+            f'timeout={timeout_rate:.0%}',
+            f'reward={mean_reward:.1f}',
+            f'zone_entry={zone_entry_rate:.0%} ==='
+        )
+
+        if self.logging:
+            self.writer.add_scalar('eval/success_rate', success_rate, episode)
+            self.writer.add_scalar('eval/collision_rate', collision_rate, episode)
+            self.writer.add_scalar('eval/timeout_rate', timeout_rate, episode)
+            self.writer.add_scalar('eval/mean_reward', mean_reward, episode)
+            self.writer.add_scalar('eval/mean_length', mean_length, episode)
+            self.writer.add_scalar('eval/zone_entry_rate', zone_entry_rate, episode)
+            self.writer.add_scalar('eval/mean_zone_steps', mean_zone_steps, episode)
+
+        if success_rate > self.best_eval_success_rate:
+            self.best_eval_success_rate = success_rate
+            model_path = os.path.join(self.model_dir_path, 'best_eval.pt')
+            torch.save({
+                'actor_state': self.actor.state_dict(),
+                'critic_state': self.critic.state_dict(),
+                'obs_rms': self.obs_rms.state_dict(),
+                'ret_rms': self.ret_rms.state_dict(),
+                'trained_episodes': episode,
+                'eval_success_rate': success_rate,
+                'eval_mean_reward': mean_reward,
+            }, model_path)
+            self.get_logger().info(
+                f'New best eval model saved: {model_path} '
+                f'(success={success_rate:.0%}, reward={mean_reward:.1f})'
+            )
 
 
 def main(args=None):
